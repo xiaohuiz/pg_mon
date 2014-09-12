@@ -457,9 +457,9 @@ class HelpView(BaseView):
     def isFiltable(self):
         return False        
 def formatPgStateLines(stats):
-    return ['pgmon - PostgreSQL version: %7s,  started at %20s' % (stats['ver'],stats['up']),
+    return ['pgmon - PostgreSQL version:%s,  started at %s' % (stats['ver'],stats['up']),
             'Cpu: %5.1f idle, %5.1f iowait,  Memory:  %s total,  %s free,  %s cached,  %s pg_share,  %s pg_private' % (stats['cpu']['idle'],stats['cpu']['iowait'],stats['memory']['total'],stats['memory']['free'],stats['memory']['cached'],stats['memory']['pg_share'],stats['memory']['pg_private']),
-            'Pg_data: %s,  %s/%s%% size,  %8.1f read,  %8.1f write;    Pg_wal: %s, %s/%s%% size,  %8.1f read,  %8.1f write' % (stats['storage']['disk_data'],stats['storage']['usage_data'],stats['storage']['usage_data%'],stats['storage']['read_data'],stats['storage']['write_data'],stats['storage']['disk_wal'],stats['storage']['usage_wal'],stats['storage']['usage_wal%'],stats['storage']['read_wal'],stats['storage']['write_wal']),
+            'Pg_data(%s): %sB/%s%% used,%8.1fread,%8.1fwrite;    Pg_wal(%s): %sB/%s%% used,%8.1fread,%8.1fwrite' % (stats['storage']['disk_data'],stats['storage']['usage_data'],stats['storage']['usage_data%'],stats['storage']['read_data'],stats['storage']['write_data'],stats['storage']['disk_wal'],stats['storage']['usage_wal'],stats['storage']['usage_wal%'],stats['storage']['read_wal'],stats['storage']['write_wal']),
             '',
            ]
 class IndexView(BaseView,StatsListener):
