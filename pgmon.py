@@ -61,6 +61,22 @@ class PgStats:
                 select indexrelid,schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages as tbl_sz, i.relpages as idx_sz, idx_scan,idx_tup_read 
                 from pg_stat_user_indexes st, pg_class r, pg_class i 
                 where st.relid=r.oid and st.indexrelid=i.oid
+                """,
+            'rep_list':"""
+                select client_addr,application_name,usename,sync_state,state,pg_current_xlog_location() as cur_location,sent_lsn-cur_lsn as sent_dif,flush_lsn-cur_lsn as flush_dif,replay_lsn-cur_lsn as replay_dif 
+                from ( 
+                    select *, (('x'||lpad(cur_loc[1],8,'0'))::bit(32)::bigint)*x'100000000'::bigint+(('x'||lpad(cur_loc[2],8,'0'))::bit(32)::bigint) as cur_lsn,  
+                        (('x'||lpad(sent_loc[1],8,'0'))::bit(32)::bigint)*x'100000000'::bigint+(('x'||lpad(sent_loc[2],8,'0'))::bit(32)::bigint) as sent_lsn, 
+                        (('x'||lpad(flush_loc[1],8,'0'))::bit(32)::bigint)*x'100000000'::bigint+(('x'||lpad(flush_loc[2],8,'0'))::bit(32)::bigint) as flush_lsn, 
+                        (('x'||lpad(replay_loc[1],8,'0'))::bit(32)::bigint)*x'100000000'::bigint+(('x'||lpad(replay_loc[2],8,'0'))::bit(32)::bigint) as replay_lsn 
+                    from  (
+                        select *,regexp_split_to_array(sent_location,'/') as sent_loc,
+                            regexp_split_to_array(flush_location,'/') as flush_loc,
+                            regexp_split_to_array(replay_location,'/') as replay_loc,
+                            regexp_split_to_array(pg_current_xlog_location(),'/') as cur_loc 
+                        from pg_stat_replication
+                    )t1 
+                )t2            
                 """
         },
         '9.3':{
@@ -102,15 +118,48 @@ class PgStats:
     pg_settings={}
     #i=0
     dbname=''
+    def getSqlResult(self,sql,db=None):
+        if db!=None:
+            self.connect(db)
+        self.cur.execute(sql)
+        return self.cur.fetchall()
     def __init__(self):
         self.connect('postgres')
         self.sqls=self.sqls_all_vertions[re.findall('\d+\.\d+',self.getPgVersion())[0]]
+        self.getRepMode()
     def connect(self,dbName):
         if self.dbname!=dbName:
             self.conn= psycopg2.connect('dbname='+dbName)
             self.conn.set_session(isolation_level='READ COMMITTED', readonly=True, deferrable=None, autocommit=True)
             self.cur=self.conn.cursor()
             self.dbname=dbName            
+    def getRepMode(self):
+        rep_mod=''
+        if float(re.findall('(\d+\.\d+)',self.getPgVersion())[0]) > 9:
+            sql_rep_mode="select pg_is_in_recovery()::text,(select count(1) from pg_stat_replication) as rep_cnt"
+            rs_rep_mod=self.getSqlResult(sql_rep_mode)
+            if len(rs_rep_mod)>0:
+                pg_is_in_recovery,rep_cnt=rs_rep_mod[0]
+                if pg_is_in_recovery=='false' and rep_cnt>0:
+                    rep_mod='master'
+                elif pg_is_in_recovery=='true':
+                    rep_mod='standby'
+                    if 'sync_app_name' not in self.pg_settings:
+                        fl_recovery_conf=os.path.join(self.getPgPath(),'recovery.conf')
+                        conninfo=subprocess.check_output(['grep','primary_conninfo',fl_recovery_conf])
+                        self.pg_settings['sync_master']=re.findall('host=([\w\.]+) ', conninfo)[0]
+                        self.pg_settings['sync_app_name']=re.findall('application_name=([\w\-\.]+)', conninfo)[0]
+            self.pg_settings['rep_mod']=rep_mod
+        return rep_mod
+    def getRepStatus(self):
+        if self.getRepMode()=='master':
+            return {'rep_mod':'master','rep_list':self.getSqlResult(self.sqls['rep_list'])}
+        elif self.getRepMode()=='standby':
+            sql= "select pg_last_xlog_receive_location(),pg_last_xlog_replay_location(),pg_last_xact_replay_timestamp()::timestamp(0)::text"
+            rep_status=self.getSqlResult(sql)
+            return {'rep_mod':'standby','rep_xlog_rcv_loc':rep_status[0][0],'rep_xlog_replay_loc':rep_status[0][1],'rep_xlog_replay_tm':rep_status[0][2]}
+        else:
+            return {'rep_mod':'standalone'}
     def getPgPath(self):
         if 'data_directory' not in self.pg_settings:
             path_data=''
@@ -300,7 +349,7 @@ class StatsCollector:
             stats_stg['write_data']=stats_stg['write_data_t']/1024
             stats_stg['read_wal']=stats_stg['read_wal_t']/1024
             stats_stg['write_wal']=stats_stg['write_wal_t']/1024
-        return {'ver':self.stats_pg.getPgVersion(),'up':self.stats_pg.getPgStartTime(),'cpu':self.stats_os.getCpuStats(),'memory':self.stats_os.getMemStats(),'storage':stats_stg}
+        return {'ver':self.stats_pg.getPgVersion(),'up':self.stats_pg.getPgStartTime(),'cpu':self.stats_os.getCpuStats(),'memory':self.stats_os.getMemStats(),'storage':stats_stg,'streaming_rep':self.stats_pg.getRepStatus()}
     def collectStats(self):
         #print self.active_statsName
         if self.active_statsName=='index':
@@ -457,11 +506,18 @@ class HelpView(BaseView):
     def isFiltable(self):
         return False        
 def formatPgStateLines(stats):
-    return ['pgmon - PostgreSQL version:%s,  started at %s' % (stats['ver'],stats['up']),
-            'Cpu: %5.1f idle, %5.1f iowait,  Memory:  %s total,  %s free,  %s cached,  %s pg_share,  %s pg_private' % (stats['cpu']['idle'],stats['cpu']['iowait'],stats['memory']['total'],stats['memory']['free'],stats['memory']['cached'],stats['memory']['pg_share'],stats['memory']['pg_private']),
-            'Pg_data(%s): %sB/%s%% used,%8.1fread,%8.1fwrite;    Pg_wal(%s): %sB/%s%% used,%8.1fread,%8.1fwrite' % (stats['storage']['disk_data'],stats['storage']['usage_data'],stats['storage']['usage_data%'],stats['storage']['read_data'],stats['storage']['write_data'],stats['storage']['disk_wal'],stats['storage']['usage_wal'],stats['storage']['usage_wal%'],stats['storage']['read_wal'],stats['storage']['write_wal']),
-            '',
-           ]
+    rep=stats['streaming_rep']
+    header=['pgmon - PostgreSQL version:%s,  started at %s  streaming rep mode: %s' % (stats['ver'],stats['up'],rep['rep_mod']),
+            'cpu: %5.1f idle, %5.1f iowait,  memory:  %s total,  %s free,  %s cached,  %s pg_share,  %s pg_private' % (stats['cpu']['idle'],stats['cpu']['iowait'],stats['memory']['total'],stats['memory']['free'],stats['memory']['cached'],stats['memory']['pg_share'],stats['memory']['pg_private']),
+            'pg_data(%s): %sB/%s%% used,%8.1fread,%8.1fwrite;    pg_wal(%s): %sB/%s%% used,%8.1fread,%8.1fwrite' % (stats['storage']['disk_data'],stats['storage']['usage_data'],stats['storage']['usage_data%'],stats['storage']['read_data'],stats['storage']['write_data'],stats['storage']['disk_wal'],stats['storage']['usage_wal'],stats['storage']['usage_wal%'],stats['storage']['read_wal'],stats['storage']['write_wal'])
+            ]
+    if rep['rep_mod']=='master':
+        for clt in rep['rep_list']:
+            header.append('sync_clt:%s@%s state:%s/%s LSN:%s diffs(sent/flush/replay):%s/%s/%s' % (clt[1],clt[0],clt[3],clt[4],clt[5],clt[6],clt[7],clt[8]))
+    elif rep['rep_mod']=='standby':
+        header.append('rep: Standby last_xlog_rcv:%s last_xlog_replay:%s last_xlog_replay_time:%s' % (rep['rep_xlog_rcv_loc'],rep['rep_xlog_replay_loc'],rep['rep_xlog_replay_tm']))
+    header.append('')
+    return header
 class IndexView(BaseView,StatsListener):
     def __init__(self):
         BaseView.__init__(self,'i')
@@ -608,8 +664,8 @@ class CursesApp:
 class PgMonApp(CursesApp,StatsCollector):
     stats_views={}
     def __init__(self):
-        CursesApp.__init__(self)
         StatsCollector.__init__(self)
+        CursesApp.__init__(self)
         self.addStatsView(HelpView())
         self.addStatsView(DBView())
         self.addStatsView(SessionView())
