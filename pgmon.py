@@ -12,8 +12,38 @@ try:
 except ImportError:
         has_psycopg2=False
 
-#has_psycopg2=False
+has_psycopg2=False
 has_psutil=False
+
+######################################################################
+###   Python 2.6 backport
+#######################################################################
+if "check_output" not in dir( subprocess ): # duck punch it in!
+    def f(*popenargs, **kwargs):
+        if 'stdout' in kwargs:
+            raise ValueError('stdout argument not allowed, it will be overridden.')
+        process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
+        output, unused_err = process.communicate()
+        retcode = process.poll()
+        return output
+    subprocess.check_output = f
+
+import ctypes as c
+_get_dict = c.pythonapi._PyObject_GetDictPtr
+_get_dict.restype = c.POINTER(c.py_object)
+_get_dict.argtypes = [c.py_object]
+
+from datetime import timedelta
+try:
+    timedelta.total_seconds // new in 2.7
+except AttributeError:
+    def total_seconds(td):
+        return float((td.microseconds +
+                      (td.seconds + td.days * 24 * 3600) * 10**6)) / 10**6
+    d = _get_dict(timedelta)[0]
+    d['total_seconds'] = total_seconds
+###############################################################################
+
 class PgSql:
     def __init__(self):
         self.dbName=''
@@ -211,25 +241,22 @@ class PgStats:
     def getPgPath(self):
         if 'data_directory' not in self.pg_settings:
             path_data=''
-            for p in psutil.process_iter():
-                cmds=p.cmdline()
-                if p.name()=='postgres' and len(re.findall('\-D ([^ ]+) ',' '.join(cmds)))>0:
-                    path_bin=re.sub('/[^/]+$','',cmds[0])
-                    path_data=re.findall('\-D ([^ ]+) ',' '.join(cmds))[0]
+            cmdlines= [' '.join(p.cmdline()) for p in psutil.process_iter() if p.name()=='postgres'] if has_psutil else [p['COMMAND'] for p in PsStats.getPs('postgres')]
+            for p in cmdlines:
+                if len(re.findall('\-D ([^ ]+) ',p))>0:
+                    path_bin=p.split()[0]
+                    path_data=re.findall('\-D ([^ ]+) ',p)[0]
                     break
             if path_data=='':
                 raise Exception('No postgres processes founed, please make sure postgres is running!')
-            #self.cur.execute("select setting from pg_settings where name='data_directory'")
-            #path_data=self.cur.fetchone()[0]
+            #path_data=self.getSqlResult("select setting from pg_settings where name='data_directory'")[0][0]
             self.pg_settings['data_directory']=path_data
             self.pg_settings['bin_directory']=path_bin
         return self.pg_settings['data_directory']
     def getPgVersion(self):
         if 'version' not in self.pg_settings:
             pg_data=self.getPgPath()
-            pg_ver=''.join(open(pg_data+'/PG_VERSION').readline().split())
-            #self.cur.execute("select substring(version() from 'PostgreSQL ([\d\.]+) on')")
-            #pg_ver=self.cur.fetchone()[0]
+            pg_ver=self.getSqlResult(r"select substring(version() from E'PostgreSQL ([0-9\.]+) on')")[0][0]
             self.pg_settings['version']=pg_ver
         return self.pg_settings['version']
     def getPgStartTime(self):
@@ -287,11 +314,13 @@ class PgStats:
         stop=''.join(re.findall('STOP TIME: (.+)$',lbl_data))
         return {'lable':lbl,'start':start,'stop':stop}
     def getPgArchiveStatus(self):
-        ps=[p for p in psutil.process_iter() if ''.join(p.cmdline()).startswith('postgres: archiver process')]
+        cmdlines= [' '.join(p.cmdline()) for p in psutil.process_iter() if p.name()=='postgres'] if has_psutil else [p['COMMAND'] for p in PsStats.getPs('postgres')]
+        ps=[p for p in cmdlines if p.startswith('postgres: archiver process')]
         status=''
         lag=0
         if len(ps)>0:
-            status=re.findall('postgres: archiver process +(.+)',''.join(ps[0].cmdline()))[0]
+            pg_data=self.getPgPath()
+            status=re.findall('postgres: archiver process +(.+)',ps[0])[0]
             lag=len([f for f in os.listdir(pg_data+'/pg_xlog/archive_status') if f.endswith('.ready')])
         return {'status':status,'lag':lag}
 def bytes2human(n):
@@ -311,38 +340,46 @@ def bytes2human(n):
     return "%sB" % n
 
 def avg(list):
-    return sum(list)/len(list)
+    l=len(list)
+    return sum(list)/l if l>0 else 0
 
 class PsStats:
     re_time=re.compile(r'(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)')
     def __init__(self,user='postgres'):
+        self.user=user
+        self.shareLock=threading.Lock()
         self.ps={}
         self.stopRequestEvent=threading.Event()
         self.thd_ps=threading.Thread(target=self.background_worker)
         self.thd_ps.start()
+    @staticmethod
+    def getPs(user):
+        ps=[p.split() for p in subprocess.check_output(('ps -u '+user+' -o pid,cputime,etime,stat,%mem,command').split()).split('\n') if len(p)>3]
+        nms=ps[0] # PID     TIME     ELAPSED STAT %MEM COMMAND
+        return [ {'PID':p[0], 'TIME':p[1], 'ELAPSED':p[2], 'STAT':p[3], '%MEM':p[4], 'COMMAND':' '.join(p[5:])} for p in ps[1:]]
     def background_worker(self):
         sleepInterval=2
         while not self.stopRequestEvent.is_set():
-            ps=[p.split() for p in subprocess.check_output('ps -u postgres -o pid,cputime,etime,stat,%mem'.split()).split('\n') if len(p)>3]
-            nms=ps[0] # PID     TIME     ELAPSED STAT %MEM
-            for p in ps[1:]:
-                pid=p[0]
-                nv=dict(zip(nms,p))
-                d,h,m,s=self.re_time.findall(p[1])[0]
+            for p in PsStats.getPs(self.user):
+                pid=p['PID']
+                nv=p
+                d,h,m,s=self.re_time.findall(p['TIME'])[0]
                 nv['cputimes'] = (0 if d=='' else 3600*24*int(d)) + (0 if h=='' else 3600*int(h)) + int(m)*60 + int(s)
-                d,h,m,s=self.re_time.findall(p[2])[0]
+                d,h,m,s=self.re_time.findall(p['ELAPSED'])[0]
                 nv['etimes'] = (0 if d=='' else 3600*24*int(d)) + (0 if h=='' else 3600*int(h)) + int(m)*60 + int(s)
-                if pid in self.ps: # existing process
-                    ov=self.ps[pid]
-                    nv['%CPU']= '%.1f' % (100.0 * (nv['cputimes'] - ov['cputimes']) / (nv['etimes'] - ov['etimes']) )
-                else:
-                    nv['%CPU']= '0.0'
+                with self.shareLock:
+                    if pid in self.ps: # existing process
+                        ov=self.ps[pid]
+                        nv['%CPU']= '%.1f' % (100.0 * (nv['cputimes'] - ov['cputimes']) / (nv['etimes'] - ov['etimes']) )
+                    else:
+                        nv['%CPU']= '0.0'
                 self.ps[pid]=nv
             self.stopRequestEvent.wait(sleepInterval)
         self.thd_ps=None
     def getPsStats(self,pid):
-        p=self.ps.get(str(pid),{'%MEM': '0', '%CPU': '0', 'STAT': 'R'})
-        return {'cpu':float(p['%CPU']),'mem':float(p['%MEM']),'status':p['STAT'],'read_t':0,'write_t':0}
+        with self.shareLock:
+            p=self.ps.get(str(pid),{'%MEM': '0', '%CPU': '0', 'STAT': 'R'})
+            return {'cpu':float(p['%CPU']),'mem':float(p['%MEM']),'status':p['STAT'],'read_t':0,'write_t':0}
     def __del__(self):
         self.stop()   #no use here since the thread hold a ref on this object
     def stop(self):   #need to be called explicitly
@@ -382,7 +419,7 @@ class OsStats:
             self.updateStat()
             self.updateDf()
     def updateStat(self):
-        if has_psutil==False:
+        if has_psutil:
             vm=psutil.virtual_memory()
             self.vm_total,self.vm_cached,self.vm_free=vm.total,vm.cached,vm.free
             cpu=psutil.cpu_times_percent()
@@ -452,16 +489,14 @@ class OsStats:
         return {'total':bytes2human(self.vm_total),'cached':bytes2human(self.vm_cached),'free':bytes2human(self.vm_free),'pg_share':bytes2human(mem_shared),'pg_private':bytes2human(mem_private)}
 
 class StatsListener:
-    statsName=''
-    dbName=''
-    stats={}
-    stats_modified=False
-    shareLock=threading.Lock()
-    stats_tm=None
-    collector=None
     def __init__(self,statsName,dbName='postgres'):
+        self.stats={}
+        self.stats_modified=False
+        self.stats_tm=None
+        self.collector=None
         self.statsName=statsName
         self.dbName=dbName
+        self.shareLock=threading.Lock()
     def updateStats(self,stats):
         with self.shareLock:
             self.stats=stats
@@ -635,6 +670,7 @@ class BaseView:
             self.filter_display='filtered by: '+self.filter_name
         else:
             self.filter_display=''
+        self.refresh_required=True
     def getSortColumns(self):
         return []
     def setOrder(self):
@@ -645,6 +681,7 @@ class BaseView:
             self.order_display='ordered by: '+self.order_name
         else:
             self.order_display=''
+        self.refresh_required=True
     def isSortable(self):
         return True
     def isFiltable(self):
