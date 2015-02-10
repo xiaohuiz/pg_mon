@@ -312,6 +312,44 @@ def bytes2human(n):
 
 def avg(list):
     return sum(list)/len(list)
+
+class PsStats:
+    re_time=re.compile(r'(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)')
+    def __init__(self,user='postgres'):
+        self.ps={}
+        self.stopRequestEvent=threading.Event()
+        self.thd_ps=threading.Thread(target=self.background_worker)
+        self.thd_ps.start()
+    def background_worker(self):
+        sleepInterval=2
+        while not self.stopRequestEvent.is_set():
+            ps=[p.split() for p in subprocess.check_output('ps -u postgres -o pid,cputime,etime,stat,%mem'.split()).split('\n') if len(p)>3]
+            nms=ps[0] # PID     TIME     ELAPSED STAT %MEM
+            for p in ps[1:]:
+                pid=p[0]
+                nv=dict(zip(nms,p))
+                d,h,m,s=self.re_time.findall(p[1])[0]
+                nv['cputimes'] = (0 if d=='' else 3600*24*int(d)) + (0 if h=='' else 3600*int(h)) + int(m)*60 + int(s)
+                d,h,m,s=self.re_time.findall(p[2])[0]
+                nv['etimes'] = (0 if d=='' else 3600*24*int(d)) + (0 if h=='' else 3600*int(h)) + int(m)*60 + int(s)
+                if pid in self.ps: # existing process
+                    ov=self.ps[pid]
+                    nv['%CPU']= '%.1f' % (100.0 * (nv['cputimes'] - ov['cputimes']) / (nv['etimes'] - ov['etimes']) )
+                else:
+                    nv['%CPU']= '0.0'
+                self.ps[pid]=nv
+            self.stopRequestEvent.wait(sleepInterval)
+        self.thd_ps=None
+    def getPsStats(self,pid):
+        p=self.ps.get(str(pid),{'%MEM': '0', '%CPU': '0', 'STAT': 'R'})
+        return {'cpu':float(p['%CPU']),'mem':float(p['%MEM']),'status':p['STAT'],'read_t':0,'write_t':0}
+    def __del__(self):
+        self.stop()   #no use here since the thread hold a ref on this object
+    def stop(self):   #need to be called explicitly
+        if self.thd_ps:
+            self.stopRequestEvent.set()
+            self.thd_ps.join()
+
 class OsStats:
     #io_pre=psutil.disk_io_counters(True)
     def __init__(self,path_data):
@@ -331,15 +369,17 @@ class OsStats:
             self.iowait=self.idle=0.0
             self.data_rd=self.data_wt=self.data_utl=0.0
             self.wal_rd=self.wal_wt=self.wal_utl=0.0
+            self.psstats=PsStats()
     def __del__(self):
         if has_psutil==False:
             self.p_iostat.terminate()
             self.fw_iostat.close()
             self.f_iostat.close()
             subprocess.check_output("rm /tmp/pgmon_psql_tmp_*",shell=True)
+            self.psstats.stop()
+            del self.psstats
     def update(self):
             self.updateStat()
-            self.updatePs()
             self.updateDf()
     def updateStat(self):
         if has_psutil==False:
@@ -370,8 +410,6 @@ class OsStats:
                 self.wal_rd=avg([float(c[0].split()[5]) for c in ios if c[0].split()[0]==self.disk_wal_nm])
                 self.wal_wt=avg([float(c[0].split()[6]) for c in ios if c[0].split()[0]==self.disk_wal_nm])
                 self.wal_utl=avg([float(c[0].split()[-1]) for c in ios if c[0].split()[0]==self.disk_wal_nm])
-    def updatePs(self):
-        self.ps=[p.split() for p in subprocess.check_output(['ps','aux']).split('\n')]
     def updateDf(self):
         if has_psutil:
             usage=psutil.disk_usage(self.path_data)
@@ -385,24 +423,21 @@ class OsStats:
                 if df[0]==self.disk_wal:
                     self.wal_used,self.wal_percent=long(df[2]),float(df[4][:-1])/100
     def getPsStats(self,pid):
-        try:
-            if has_psutil:
+        if has_psutil:
+            try:
                 p=psutil.Process(pid)
                 io=p.io_counters()
                 return {'cpu':p.cpu_percent(),'mem':p.memory_percent(),'status':p.status(),'read_t':io.read_bytes,'write_t':io.write_bytes}
-            else:
-                for p in self.ps:
-                    if long(p[1])==pid:
-                        return {'cpu':float(p[2]),'mem':float(p[3]),'status':p[7],'read_t':0,'write_t':0}
-        except Exception:
-            return {'cpu':0,'mem':0,'status':'NA','read_t':0,'write_t':0}
+            except Exception:
+                return {'cpu':0,'mem':0,'status':'NA','read_t':0,'write_t':0}
+        else:
+            return self.psstats.getPsStats(pid)
     def getStorageStats(self):
         return {'disk_data':self.disk_data,'usage_data':bytes2human(self.data_used),'usage_data%':self.data_percent,'read_data_t':self.data_rd,'write_data_t':self.data_wt,'util_data':self.data_utl,
                 'disk_wal':self.disk_wal,'usage_wal':bytes2human(self.wal_used),'usage_wal%':self.wal_percent,'read_wal_t':self.wal_rd,'write_wal_t':self.wal_wt,'util_wal':self.wal_utl
                 }
     def getCpuStats(self):
         return {'iowait':self.iowait,'idle':self.idle}
-
     def getMemStats(self):
         def getMemoryOfProcess(p):
             try:
@@ -815,12 +850,6 @@ class PgMonApp(CursesApp,StatsCollector):
         CursesApp.addView(self,view)
         if isinstance(view,StatsListener):
             StatsCollector.addListener(self,view)
-    # def setActiveView(self,view_name):
-    #     CursesApp.setActiveView(self,view_name)
-    #     if isinstance(self.stats_views[view_name],StatsListener):
-    #         StatsCollector.setActiveListener(self,self.stats_views[view_name].statsName)
-    #     else:
-    #         StatsCollector.setActiveListener(self,'')
     def run(self):
         CursesApp.run(self)
         StatsCollector.stop(self)
