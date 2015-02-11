@@ -18,7 +18,7 @@ has_psutil=False
 ######################################################################
 ###   Python 2.6 backport
 #######################################################################
-if "check_output" not in dir( subprocess ): # duck punch it in!
+if "check_output" not in dir( subprocess ):
     def f(*popenargs, **kwargs):
         if 'stdout' in kwargs:
             raise ValueError('stdout argument not allowed, it will be overridden.')
@@ -35,7 +35,7 @@ _get_dict.argtypes = [c.py_object]
 
 from datetime import timedelta
 try:
-    timedelta.total_seconds // new in 2.7
+    timedelta.total_seconds # new in 2.7
 except AttributeError:
     def total_seconds(td):
         return float((td.microseconds +
@@ -63,8 +63,8 @@ class PgSql:
             data=subprocess.check_output(['psql','-d%s'%dbName,'-c', r"copy (%s) to stdout with delimiter E'\t'" % ' '.join(sql.split())])
             return [ tuple(line.split('\t')) for line in data.split('\n') if len(line)>0 ]
 stats_items={
-    'db': {'columns':['database','size','session','xact_commit','tps','blks_hit','blks_read','hit%','tup_iud','tup_returned'],
-            'formats':['%12s%8s%8s%18s%10.1f%18s%18s%9s%18s%18s']
+    'db': {'columns':['db','size_pretty','sessions','xact_commit','tps','blks_hit','blks_read','hit_ratio','tup_iud','tup_returned'],
+            'formats':['s','s','s','s','.1f','s','s','s','s','s']
            },
     'session':{'columns':['pid','cpu','mem','read','write','db','user','clt_app','clt_addr','bknd_age','xact_age','query_age','blking_id','locks','state','query'],
                 'formats':['s','.1f','.1f','.1f','.1f','s','s','s','s','s','s','s','s','s','s','float_s']
@@ -267,12 +267,12 @@ class PgStats:
     def getTableList(self,db):
         tl={}
         for r in self.getSqlResult(self.sqls['table_list'],db):
-            tl[r[0]]=dict(zip(stats_items['table']['columns'],r[:3]+tuple([long(t) for t in r[3:13]])+r[13:15]+(long(r[15]),long(r[16]),)))
+            tl[r[0]]=dict(zip(stats_items['table']['columns'],r[:3]+tuple([long(t) for t in r[3:13]])+r[13:15]+(long(r[15] if r[15]!='' else 0),(long(r[16] if r[16]!='' else 0)),)))
         return tl
     def getIndexList(self,db):
         il={}
         for r in self.getSqlResult(self.sqls['index_list'],db):
-            il[r[0]]=dict(zip(stats_items['index']['columns'],r))
+            il[r[0]]=dict(zip(stats_items['index']['columns'],r[:4]+tuple([long(t) for t in r[4:]])))
         return il
     def getSessionList(self):
         sl={}
@@ -283,7 +283,7 @@ class PgStats:
         #self.i+=1
         db_list={}#'i':self.i}
         for db in self.getSqlResult(self.sqls['db_list']):
-            db_list[db[1]]={'snap_tm':float(db[0]),'size':long(db[2]),'sessions':int(db[3]),'xact_commit':long(db[4]),'xact_rollback':long(db[5]),'blks_hit':long(db[6]),'blks_read':long(db[7]),'tup_iud':long(db[8]),'tup_returned':long(db[9])}
+            db_list[db[1]]={'db':db[1],'snap_tm':float(db[0]),'size':long(db[2]),'size_pretty':bytes2human(long(db[2])),'sessions':int(db[3]),'xact_commit':long(db[4]),'xact_rollback':long(db[5]),'blks_hit':long(db[6]),'blks_read':long(db[7]),'tup_iud':long(db[8]),'tup_returned':long(db[9])}
             delt_tm=db_list[db[1]]['snap_tm']-self.db_list[db[1]]['snap_tm'] if db[1] in self.db_list else 0
             db_list[db[1]]['tps'] = (db_list[db[1]]['xact_commit']-self.db_list[db[1]]['xact_commit'])/delt_tm if delt_tm>0 else 0
             db_list[db[1]]['hit_ratio']=db_list[db[1]]['blks_hit']*100/(db_list[db[1]]['blks_hit']+db_list[db[1]]['blks_read']) if db_list[db[1]]['blks_hit']+db_list[db[1]]['blks_read']>0 else 0
@@ -789,7 +789,7 @@ class SessionView(BaseView,StatsListener):
                     sessions=stats['session'].items()
                 for s in sessions:
                     s[1]['query']=' '.join(s[1]['query'].split())
-                self.lines = formatPgStateLines(stats)+ formatTable(sessions,stats_items['session']['columns'],stats_items['session']['formats'],self.filter_name)
+                self.lines = formatPgStateLines(stats) + formatTable(sessions,stats_items['session']['columns'],stats_items['session']['formats'],self.filter_name)
                 BaseView.updateContent(self)
 class DBView(BaseView,StatsListener):
     def __init__(self):
@@ -808,12 +808,7 @@ class DBView(BaseView,StatsListener):
                     dbs=sorted(stats['db'].items(),key=lambda s:s[1][self.order_name],reverse=True)
                 else:
                     dbs=stats['db'].items()
-                self.lines= \
-                    formatPgStateLines(stats) +\
-                    ['%12s%8s%8s%18s%10s%18s%18s%9s%18s%18s' % ('database','size','session','xact_commit','tps','blks_hit','blks_read','hit%','tup_iud','tup_returned')] + \
-                    ['%12s%8s%8s%18s%10.1f%18s%18s%9s%18s%18s' % (db,bytes2human(ms['size']),ms['sessions'],ms['xact_commit'],ms['tps'],ms['blks_hit'],ms['blks_read'],str(ms['hit_ratio_delt'])+'/'+str(ms['hit_ratio']),ms['tup_iud'],ms['tup_returned']) \
-                        for db,ms in dbs if len(self.filter_name)==0 or re.search(self.filter_name,db)
-                    ]
+                self.lines= formatPgStateLines(stats) + formatTable(dbs,stats_items['db']['columns'],stats_items['db']['formats'],self.filter_name)
                 BaseView.updateContent(self)
 
 class CursesApp:
