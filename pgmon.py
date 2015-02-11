@@ -456,9 +456,9 @@ class OsStats:
         else:
             for df in [d.split() for d in subprocess.check_output(['df']).split('\n')[1:] if len(d)>6]:
                 if df[0]==self.disk_data:
-                    self.data_used,self.data_percent=long(df[2]),float(df[4][:-1])/100
+                    self.data_used,self.data_percent=long(df[2])*1024,float(df[4][:-1])/100
                 if df[0]==self.disk_wal:
-                    self.wal_used,self.wal_percent=long(df[2]),float(df[4][:-1])/100
+                    self.wal_used,self.wal_percent=long(df[2])*1024,float(df[4][:-1])/100
     def getPsStats(self,pid):
         if has_psutil:
             try:
@@ -709,7 +709,7 @@ def formatPgStateLines(stats):
     rep=stats['streaming_rep']
     header=['pgmon - PostgreSQL version:%s,  started at %s  streaming rep mode: %s' % (stats['ver'],stats['up'],rep['rep_mod']),
             'cpu: %5.1f idle, %5.1f iowait,  memory:  %s total,  %s free,  %s cached,  %s pg_share,  %s pg_private' % (stats['cpu']['idle'],stats['cpu']['iowait'],stats['memory']['total'],stats['memory']['free'],stats['memory']['cached'],stats['memory']['pg_share'],stats['memory']['pg_private']),
-            'pg_data(%s): %sB/%s%% used,%8.1fread,%8.1fwrite;    pg_wal(%s): %sB/%s%% used,%8.1fread,%8.1fwrite' % (stats['storage']['disk_data'],stats['storage']['usage_data'],stats['storage']['usage_data%'],stats['storage']['read_data'],stats['storage']['write_data'],stats['storage']['disk_wal'],stats['storage']['usage_wal'],stats['storage']['usage_wal%'],stats['storage']['read_wal'],stats['storage']['write_wal'])
+            'pg_data(%s): %sB/%s%% used,%8.1fread,%8.1fwrite;    pg_wal(%s): %sB/%s%% used,%8.1fread,%8.1fwrite' % (stats['storage']['disk_data'],stats['storage']['usage_data'],stats['storage']['usage_data%']*100,stats['storage']['read_data'],stats['storage']['write_data'],stats['storage']['disk_wal'],stats['storage']['usage_wal'],stats['storage']['usage_wal%']*100,stats['storage']['read_wal'],stats['storage']['write_wal'])
             ]
     if rep['rep_mod']=='master':
         for clt in rep['rep_list']:
