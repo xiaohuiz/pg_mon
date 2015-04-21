@@ -74,6 +74,9 @@ stats_items={
             },
     'index':{'columns':['scm_id','scm','tbl','idx','tbl_sz','idx_sz','idx_scn','idx_tup_rd'],
             'formats':['s','s','s','s','s','s','s','s']
+            },
+    'lock':{'columns':['pid','relname','locktype','mode','virtualxid','transactionid','granted','blocked_by'],
+            'formats':['s','s','s','s','s','s','s','s']
             }
     }
 
@@ -91,10 +94,12 @@ class PgStats:
                     from pg_locks w,pg_locks b
                     where b.granted and not w.granted and w.pid<>b.pid and (w.transactionid=b.transactionid or (w.database=b.database and w.relation=b.relation))
                 )
-                select procpid as backend_id, datname as db, usename as user,'' as clt_app, client_addr as clt_addr,(now()-backend_start)::interval(0) backend_age,(now()-xact_start)::interval(0) as xact_age,(now()-query_start)::interval(0) query_age,lw.blocking_id,locks,'' as state,replace(replace(current_query,E'\n',''),E'\t','') as query
-                from pg_stat_activity s
-                left outer join lw on s.procpid=lw.waiting_id
-                left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.procpid=lc.pid
+                select * from (
+                    select procpid as backend_id, datname as db, usename as user,'' as clt_app, client_addr as clt_addr,(now()-backend_start)::interval(0) backend_age,(now()-xact_start)::interval(0) as xact_age,(now()-query_start)::interval(0) query_age,lw.blocking_id,locks,'' as state,replace(replace(current_query,E'\n',''),E'\t','') as query
+                    from pg_stat_activity s
+                    left outer join lw on s.procpid=lw.waiting_id
+                    left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.procpid=lc.pid
+                )t
                 """,
             'table_list':"""
                 select st.relid,schemaname as scm, relname as tbl,  relpages,coalesce(indpages,0),relfrozenxid,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,'' as autovcm_n,'' as  autoanz_n
@@ -112,6 +117,13 @@ class PgStats:
                 select indexrelid,schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages as tbl_sz, i.relpages as idx_sz, idx_scan,idx_tup_read
                 from pg_stat_user_indexes st, pg_class r, pg_class i
                 where st.relid=r.oid and st.indexrelid=i.oid
+                """,
+            'lock_list':"""
+                select c.pid,relname,c.locktype,c.mode,c.virtualxid,c.transactionid,c.granted,h.pid as blocked_by
+                from pg_locks c
+                    left outer join pg_locks h on h.granted and not c.granted and (h.transactionid=c.transactionid or (h.database=c.database and h.relation=c.relation))
+                    left outer join pg_class r on c.relation=r.oid
+                where c.pid=
                 """
         },
         '9.1':{
@@ -177,10 +189,12 @@ class PgStats:
                     from pg_locks w,pg_locks b
                     where b.granted and not w.granted and w.pid<>b.pid and (w.transactionid=b.transactionid or (w.database=b.database and w.relation=b.relation))
                 )
-                select s.pid as backend_id, datname as db, usename as user,application_name as clt_app, client_addr as clt_addr,(now()-backend_start)::interval(0) backend_age,(now()-xact_start)::interval(0) as xact_age,(now()-query_start)::interval(0) query_age,lw.blocking_id,locks,state,replace(replace(query,E'\n',''),E'\t','') as query
-                from pg_stat_activity s
-                left outer join lw on s.pid=lw.waiting_id
-                left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.pid=lc.pid
+                select * from (
+                    select s.pid as backend_id, datname as db, usename as user,application_name as clt_app, client_addr as clt_addr,(now()-backend_start)::interval(0) backend_age,(now()-xact_start)::interval(0) as xact_age,(now()-query_start)::interval(0) query_age,lw.blocking_id,locks,state,replace(replace(query,E'\\n',''),E'\\t','') as query
+                    from pg_stat_activity s
+                    left outer join lw on s.pid=lw.waiting_id
+                    left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.pid=lc.pid
+                )t
                 """,
             'table_list':
                 """select st.relid,schemaname as scm, relname as tbl,  relpages,coalesce(indpages,0),relfrozenxid,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
@@ -198,6 +212,13 @@ class PgStats:
                 select indexrelid,schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages as tbl_sz, i.relpages as idx_sz, idx_scan,idx_tup_read
                 from pg_stat_user_indexes st, pg_class r, pg_class i
                 where st.relid=r.oid and st.indexrelid=i.oid
+                """,
+            'lock_list':"""
+                select c.pid,relname,c.locktype,c.mode,c.virtualxid,c.transactionid,c.granted,h.pid as blocked_by
+                from pg_locks c
+                    left outer join pg_locks h on h.granted and not c.granted and (h.transactionid=c.transactionid or (h.database=c.database and h.relation=c.relation))
+                    left outer join pg_class r on c.relation=r.oid
+                where c.pid=
                 """
         }
     }
@@ -274,11 +295,22 @@ class PgStats:
         for r in self.getSqlResult(self.sqls['index_list'],db):
             il[r[0]]=dict(zip(stats_items['index']['columns'],r[:4]+tuple([long(t) for t in r[4:]])))
         return il
+    def getLockList(self,db,pid):
+        rows=self.getSqlResult(self.sqls['lock_list']+str(pid),db)
+        return [dict(zip(stats_items['lock']['columns'],r)) for r in rows]
     def getSessionList(self):
         sl={}
         for r in self.getSqlResult(self.sqls['session_list']):
             sl[r[0]]=dict(zip(['pid','db','user','clt_app','clt_addr','bknd_age','xact_age','query_age','blking_id','locks','state','query'],r))
         return sl
+    def getSessionDetail(self,pid):
+        sn_ = self.getSqlResult(self.sqls['session_list']+' where backend_id='+pid)
+        if len(sn_)>0:
+            sn=dict(zip(['pid','db','user','clt_app','clt_addr','bknd_age','xact_age','query_age','blking_id','locks','state','query'],sn_[0]))
+            db=sn['db']
+            locks=self.getLockList(db,pid)
+            return {'session':sn,'locks':locks}
+        return None
     def getDbList(self):
         #self.i+=1
         db_list={}#'i':self.i}
@@ -433,7 +465,7 @@ class OsStats:
             rd_wal=io_cur[disk_nm].read_bytes#(io_cur[self.disk_wal].read_bytes-io_pre[self.disk_wal].read_bytes)/(io_cur[self.disk_wal].read_time-io_pre[self.disk_wal].read_time)*1000/1024/1024 if io_cur[self.disk_wal].read_time-io_pre[self.disk_wal].read_time>0 else 0
         else:
             vm=subprocess.check_output(['free']).split('\n')[1].split()
-            self.vm_total,self.vm_cached,self.vm_free=long(vm[1]),long(vm[6]),long(vm[3])
+            self.vm_total,self.vm_cached,self.vm_free=long(vm[1])*1024,long(vm[6])*1024,long(vm[3])*1024
             iostat=self.f_iostat.read()
             cs=self.re_cpu.findall(iostat)
             if len(cs)>0:
@@ -496,6 +528,7 @@ class StatsListener:
         self.collector=None
         self.statsName=statsName
         self.dbName=dbName
+        self.pid=None
         self.shareLock=threading.Lock()
     def updateStats(self,stats):
         with self.shareLock:
@@ -543,6 +576,16 @@ class StatsCollector:
             stats_stg['write_wal']=stats_stg['write_wal_t']/1024
         return {'ver':self.stats_pg.getPgVersion(),'up':self.stats_pg.getPgStartTime(),'cpu':self.stats_os.getCpuStats(),'memory':self.stats_os.getMemStats(),'storage':stats_stg,'streaming_rep':self.stats_pg.getRepStatus()}
     def collectStats(self):
+        def updatePsStatsToSession(pid,s):
+            s.update(self.stats_os.getPsStats(int(pid)))
+            if last_stats_tm and pid in last_stats['session']:
+                dur=(datetime.datetime.utcnow()-last_stats_tm).total_seconds()
+                s0=last_stats['session'][pid]
+                s['read']=(s['read_t']-s0['read_t'])/dur/1024
+                s['write']=(s['write_t']-s0['write_t'])/dur/1024
+            else:
+                s['read']=s['read_t']/1024.0
+                s['write']=s['write_t']/1024.0
         #print self.active_statsName
         if self.active_statsName=='index':
             db=self.listners[self.active_statsName].dbName
@@ -570,19 +613,18 @@ class StatsCollector:
             last_stats_tm=self.listners[self.active_statsName].stats_tm
             last_stats=self.listners[self.active_statsName].stats
             for pid,s in session_list.iteritems():  #append process stats cpu,mem,io
-                s.update(self.stats_os.getPsStats(int(pid)))
-                if last_stats_tm and pid in last_stats['session']:
-                    dur=(datetime.datetime.utcnow()-last_stats_tm).total_seconds()
-                    s0=last_stats['session'][pid]
-                    s['read']=(s['read_t']-s0['read_t'])/dur/1024
-                    s['write']=(s['write_t']-s0['write_t'])/dur/1024
-                else:
-                    s['read']=s['read_t']/1024.0
-                    s['write']=s['write_t']/1024.0
+                updatePsStatsToSession(pid,s)
             stats=self.getStatsState()
             stats['session']=session_list
             with self.shareLock:
                 if self.active_statsName=='session':
+                    self.listners[self.active_statsName].updateStats(stats)
+        if self.active_statsName=='session_detail':
+            pid=self.listners[self.active_statsName].pid
+            stats=self.getStatsState()
+            stats['session_detail']=self.stats_pg.getSessionDetail(pid)
+            with self.shareLock:
+                if self.active_statsName=='session_detail':
                     self.listners[self.active_statsName].updateStats(stats)
     def __init__(self,updateInterval=600):
         self.stats_pg=PgStats()
@@ -694,8 +736,9 @@ class HelpView(BaseView):
             'h: print this screen',
             'd: database view,  list all databases',
             's: session view, list all current sessions'
-            't: table view, list all user tables',
-            'i: index view, list all user index',
+            't: table view, list all user tables for a specified database',
+            'i: index view, list all user index for a specified database',
+            'l: locks view, list all locks for a specified session id',
             'b: background writer view, show stats about background writer',
             'r: refresh'
             ]
@@ -736,9 +779,9 @@ class IndexView(BaseView,StatsListener):
             stats=self.getStats()
             if 'ver' in stats:
                 if self.order_name!='':
-                    indexs=sorted(stats['index'].items(),key=lambda s:s[1][self.order_name], reverse=True)
+                    indexs=sorted(stats['index'].values(),key=lambda s:s[1][self.order_name], reverse=True)
                 else:
-                    indexs=stats['index'].items()
+                    indexs=stats['index'].values()
                 self.lines = formatPgStateLines(stats) + formatTable(indexs,stats_items['index']['columns'],stats_items['index']['formats'],self.filter_name)
                 BaseView.updateContent(self)
 class TableView(BaseView,StatsListener):
@@ -759,17 +802,48 @@ class TableView(BaseView,StatsListener):
             stats=self.getStats()
             if 'ver' in stats:
                 if self.order_name!='':
-                    tables=sorted(stats['table'].items(),key=lambda s:s[1][self.order_name], reverse=True)
+                    tables=sorted(stats['table'].values(),key=lambda s:s[1][self.order_name], reverse=True)
                 else:
-                    tables=stats['table'].items()
+                    tables=stats['table'].values()
                 self.lines = formatPgStateLines(stats) + formatTable(tables,stats_items['table']['columns'],stats_items['table']['formats'],self.filter_name)
                 BaseView.updateContent(self)
-def formatTable(rows,columns,formats,filter):
-    max_lens=[max(len(c),max([0]+[len(('%'+f) % r[c]) for id,r in rows])) if f!='float_s' else 0 for f,c in zip(formats,columns)]
+class SessionDetailView(BaseView,StatsListener):
+    def __init__(self):
+        BaseView.__init__(self,'l')
+        StatsListener.__init__(self,'session_detail')
+    def getSortColumns(self):
+        return ['tbl_sz','idx_sz','seq_scn','idx_scn','tup_i','tup_u','tup_d','live_tup','dead_tup']
+    def setActive(self):
+        pid=self.getInput('backend id:')
+        if len(pid)>0:
+            self.pid=pid
+            StatsListener.setActive(self)
+            return BaseView.setActive(self)
+        return False
+    def updateContent(self):
+        if self.stats_modified or self.refresh_required:
+            stats=self.getStats()
+            if 'ver' in stats:
+                self.lines = formatPgStateLines(stats)
+                if stats['session_detail']!=None:
+                    sn=stats['session_detail']['session']
+                    self.lines.append('session:'+self.pid)
+                    self.lines.append('  '.join(['%s:%s'% (k,sn[k]) for k in ['db','user','clt_app','clt_addr','bknd_age','xact_age','query_age','state']]))
+                    self.lines.append('current query: '+' '.join(sn['query'].split()))
+                    self.lines.append('')
+                    self.lines.append('locks requested by:'+self.pid)
+                    self.lines.extend(formatTable(stats['session_detail']['locks'],stats_items['lock']['columns'],stats_items['lock']['formats'],self.filter_name))
+                else:
+                    self.lines.append('not existing pid %s:' % self.pid)
+                BaseView.updateContent(self)
+def formatTable(rows,columns,formats,filter_raw):
+    invert = (filter_raw[:2]=='! ')
+    filter = filter_raw[2:] if invert else filter_raw
+    max_lens=[max(len(c),max([0]+[len(('%'+f) % r[c]) for r in rows])) if f!='float_s' else 0 for f,c in zip(formats,columns)]
     return [''.join([('%'+str(l+1)+'s' if l>0 else ' %s') % c for l,c in zip(max_lens,columns)])]+ \
            [l for l in  \
-                [ ''.join([('%'+str(l+1)+f if f!='float_s' else ' %s') % r[c] for l,f,c in zip(max_lens,formats,columns)]) for id,r in rows] \
-            if len(filter)==0 or re.search(filter,l)]
+                [ ''.join([('%'+str(l+1)+f if f!='float_s' else ' %s') % r[c] for l,f,c in zip(max_lens,formats,columns)]) for r in rows] \
+            if len(filter)==0 or ((re.search(filter,l)!=None)!=invert)]
 class SessionView(BaseView,StatsListener):
     def __init__(self):
         BaseView.__init__(self,'s')
@@ -784,11 +858,11 @@ class SessionView(BaseView,StatsListener):
             stats=self.getStats()
             if 'ver' in stats:
                 if self.order_name!='':
-                    sessions=sorted(stats['session'].items(),key=lambda s:s[1][self.order_name], reverse=True)
+                    sessions=sorted(stats['session'].values(),key=lambda s:s[self.order_name], reverse=True)
                 else:
-                    sessions=stats['session'].items()
+                    sessions=stats['session'].values()
                 for s in sessions:
-                    s[1]['query']=' '.join(s[1]['query'].split())
+                    s['query']=' '.join(s['query'].split())
                 self.lines = formatPgStateLines(stats) + formatTable(sessions,stats_items['session']['columns'],stats_items['session']['formats'],self.filter_name)
                 BaseView.updateContent(self)
 class DBView(BaseView,StatsListener):
@@ -805,9 +879,9 @@ class DBView(BaseView,StatsListener):
             stats=self.getStats()
             if 'ver' in stats:
                 if self.order_name!='':
-                    dbs=sorted(stats['db'].items(),key=lambda s:s[1][self.order_name],reverse=True)
+                    dbs=sorted(stats['db'].values(),key=lambda s:s[1][self.order_name],reverse=True)
                 else:
-                    dbs=stats['db'].items()
+                    dbs=stats['db'].values()
                 self.lines= formatPgStateLines(stats) + formatTable(dbs,stats_items['db']['columns'],stats_items['db']['formats'],self.filter_name)
                 BaseView.updateContent(self)
 
@@ -877,6 +951,7 @@ class PgMonApp(CursesApp,StatsCollector):
         self.addStatsView(SessionView())
         self.addStatsView(TableView())
         self.addStatsView(IndexView())
+        self.addStatsView(SessionDetailView())
     def addStatsView(self,view):
         self.stats_views[view.activeKey]=view
         CursesApp.addView(self,view)
