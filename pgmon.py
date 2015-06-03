@@ -60,7 +60,7 @@ class PgSql:
             self.cur.execute(sql)
             return self.cur.fetchall()
         else:
-            data=subprocess.check_output(['psql','-d%s'%dbName,'-c', r"copy (%s) to stdout with delimiter E'\t'" % ' '.join(sql.split())])
+            data=subprocess.check_output(['psql','-d%s'%dbName,'-c', r"copy (%s) to stdout with delimiter E'\t' NULL as ' -- '" % ' '.join(sql.split())])
             return [ tuple(line.split('\t')) for line in data.split('\n') if len(line)>0 ]
 stats_items={
     'db': {'columns':['db','size_pretty','sessions','xact_commit','tps','blks_hit','blks_read','hit_ratio','tup_iud','tup_returned'],
@@ -740,6 +740,7 @@ class HelpView(BaseView):
             'i: index view, list all user index for a specified database',
             'l: locks view, list all locks for a specified session id',
             'b: background writer view, show stats about background writer',
+            '/: filter current view via regex, start with "! " for invert match',
             'r: refresh'
             ]
     def __init__(self):
