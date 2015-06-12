@@ -102,7 +102,7 @@ class PgStats:
                 )t
                 """,
             'table_list':"""
-                select st.relid,schemaname as scm, relname as tbl,  relpages,coalesce(indpages,0),relfrozenxid,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,'' as autovcm_n,'' as  autoanz_n
+                select st.relid,schemaname as scm, relname as tbl,  relpages*8,coalesce(indpages,0)*8,relfrozenxid,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,'' as autovcm_n,'' as  autoanz_n
                     from pg_stat_user_tables st,
                 ( select relid,t.relpages+coalesce(ts.relpages,0)+coalesce(ti.relpages,0) as relpages,indpages,t.relfrozenxid
                     from
@@ -114,7 +114,7 @@ class PgStats:
                 where st.relid=p.relid
                 """,
             'index_list':"""
-                select indexrelid,schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages as tbl_sz, i.relpages as idx_sz, idx_scan,idx_tup_read
+                select indexrelid,schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages*8 as tbl_sz, i.relpages*8 as idx_sz, idx_scan,idx_tup_read
                 from pg_stat_user_indexes st, pg_class r, pg_class i
                 where st.relid=r.oid and st.indexrelid=i.oid
                 """,
@@ -144,7 +144,7 @@ class PgStats:
                 left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.procpid=lc.pid
                 """,
             'table_list':"""
-                select st.relid,schemaname as scm, relname as tbl,  relpages,coalesce(indpages,0),relfrozenxid,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
+                select st.relid,schemaname as scm, relname as tbl,  relpages*8,coalesce(indpages,0)*8,relfrozenxid,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
                     from pg_stat_user_tables st,
                 ( select relid,t.relpages+coalesce(ts.relpages,0)+coalesce(ti.relpages,0) as relpages,indpages,t.relfrozenxid
                     from
@@ -156,7 +156,7 @@ class PgStats:
                 where st.relid=p.relid
                 """,
             'index_list':"""
-                select indexrelid,schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages as tbl_sz, i.relpages as idx_sz, idx_scan,idx_tup_read
+                select indexrelid,schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages*8 as tbl_sz, i.relpages*8 as idx_sz, idx_scan,idx_tup_read
                 from pg_stat_user_indexes st, pg_class r, pg_class i
                 where st.relid=r.oid and st.indexrelid=i.oid
                 """,
@@ -197,7 +197,7 @@ class PgStats:
                 )t
                 """,
             'table_list':
-                """select st.relid,schemaname as scm, relname as tbl,  relpages,coalesce(indpages,0),relfrozenxid,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
+                """select st.relid,schemaname as scm, relname as tbl,  relpages*8, coalesce(indpages,0)*8, relfrozenxid,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
                     from pg_stat_user_tables st,
                 ( select relid,t.relpages+coalesce(ts.relpages,0)+coalesce(ti.relpages,0) as relpages,indpages,t.relfrozenxid
                     from
@@ -209,7 +209,7 @@ class PgStats:
                 where st.relid=p.relid
                 """,
             'index_list':"""
-                select indexrelid,schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages as tbl_sz, i.relpages as idx_sz, idx_scan,idx_tup_read
+                select indexrelid,schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages*8 as tbl_sz, i.relpages*8 as idx_sz, idx_scan,idx_tup_read
                 from pg_stat_user_indexes st, pg_class r, pg_class i
                 where st.relid=r.oid and st.indexrelid=i.oid
                 """,
@@ -780,7 +780,7 @@ class IndexView(BaseView,StatsListener):
             stats=self.getStats()
             if 'ver' in stats:
                 if self.order_name!='':
-                    indexs=sorted(stats['index'].values(),key=lambda s:s[1][self.order_name], reverse=True)
+                    indexs=sorted(stats['index'].values(),key=lambda s:s[self.order_name], reverse=True)
                 else:
                     indexs=stats['index'].values()
                 self.lines = formatPgStateLines(stats) + formatTable(indexs,stats_items['index']['columns'],stats_items['index']['formats'],self.filter_name)
@@ -803,7 +803,7 @@ class TableView(BaseView,StatsListener):
             stats=self.getStats()
             if 'ver' in stats:
                 if self.order_name!='':
-                    tables=sorted(stats['table'].values(),key=lambda s:s[1][self.order_name], reverse=True)
+                    tables=sorted(stats['table'].values(),key=lambda s:s[self.order_name], reverse=True)
                 else:
                     tables=stats['table'].values()
                 self.lines = formatPgStateLines(stats) + formatTable(tables,stats_items['table']['columns'],stats_items['table']['formats'],self.filter_name)
@@ -880,7 +880,7 @@ class DBView(BaseView,StatsListener):
             stats=self.getStats()
             if 'ver' in stats:
                 if self.order_name!='':
-                    dbs=sorted(stats['db'].values(),key=lambda s:s[1][self.order_name],reverse=True)
+                    dbs=sorted(stats['db'].values(),key=lambda s:[self.order_name],reverse=True)
                 else:
                     dbs=stats['db'].values()
                 self.lines= formatPgStateLines(stats) + formatTable(dbs,stats_items['db']['columns'],stats_items['db']['formats'],self.filter_name)
