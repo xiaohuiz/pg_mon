@@ -219,6 +219,22 @@ class PgStats:
                     left outer join pg_locks h on h.granted and not c.granted and (h.transactionid=c.transactionid or (h.database=c.database and h.relation=c.relation))
                     left outer join pg_class r on c.relation=r.oid
                 where c.pid=
+                """,
+            'rep_list':"""
+                select client_addr,application_name,usename,sync_state,state,pg_current_xlog_location() as cur_location,sent_lsn-cur_lsn as sent_dif,flush_lsn-cur_lsn as flush_dif,replay_lsn-cur_lsn as replay_dif
+                from (
+                    select *, (('x'||lpad(cur_loc[1],8,'0'))::bit(32)::bigint)*x'100000000'::bigint+(('x'||lpad(cur_loc[2],8,'0'))::bit(32)::bigint) as cur_lsn,
+                        (('x'||lpad(sent_loc[1],8,'0'))::bit(32)::bigint)*x'100000000'::bigint+(('x'||lpad(sent_loc[2],8,'0'))::bit(32)::bigint) as sent_lsn,
+                        (('x'||lpad(flush_loc[1],8,'0'))::bit(32)::bigint)*x'100000000'::bigint+(('x'||lpad(flush_loc[2],8,'0'))::bit(32)::bigint) as flush_lsn,
+                        (('x'||lpad(replay_loc[1],8,'0'))::bit(32)::bigint)*x'100000000'::bigint+(('x'||lpad(replay_loc[2],8,'0'))::bit(32)::bigint) as replay_lsn
+                    from  (
+                        select *,regexp_split_to_array(sent_location,'/') as sent_loc,
+                            regexp_split_to_array(flush_location,'/') as flush_loc,
+                            regexp_split_to_array(replay_location,'/') as replay_loc,
+                            regexp_split_to_array(pg_current_xlog_location(),'/') as cur_loc
+                        from pg_stat_replication
+                    )t1
+                )t2
                 """
         }
     }
