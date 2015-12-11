@@ -293,7 +293,7 @@ class PgStats:
     def getPgVersion(self):
         if 'version' not in self.pg_settings:
             pg_data=self.getPgPath()
-            pg_ver=self.getSqlResult(r"select substring(version() from E'PostgreSQL ([0-9\.]+) on')")[0][0]
+            pg_ver=self.getSqlResult(r"select substring(version() from E'PostgreSQL ([^ ]+) on')")[0][0]
             self.pg_settings['version']=pg_ver
         return self.pg_settings['version']
     def getPgStartTime(self):
