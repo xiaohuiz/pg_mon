@@ -327,6 +327,9 @@ class PgStats:
             locks=self.getLockList(db,pid)
             return {'session':sn,'locks':locks}
         return None
+    def terminateBackend(self,pid):
+        _rs = self.getSqlResult('select pg_terminate_backend(%s)' % pid)
+        return len(_rs)>0 and _rs[0][0]=='t'
     def getDbList(self):
         #self.i+=1
         db_list={}#'i':self.i}
@@ -684,6 +687,7 @@ class BaseView:
     refresh_required=True
     filter_display=''
     filter_name=''
+    msg=''
     order_display=''
     order_name=''
     app=None
@@ -702,8 +706,11 @@ class BaseView:
         win.erase()
         for y,line in enumerate(self.lines[:self.height-1]):
             win.addstr(y,0,line[:self.width])
-        if len(self.order_name)>0 or len(self.filter_name)>0:
-            win.addstr(self.height-1,0,self.filter_display+'\t'+self.order_display)
+        if len(self.order_name)>0 or len(self.filter_name)>0 or len(self.msg)>0:
+            win.addstr(self.height-1,0,self.filter_display+'\t'+self.order_display+'\t'+self.msg)
+    def setMessage(self,message):
+        self.msg=message;
+        self.updateView()
     def setActive(self):
         self.refresh_required=True
         return True
@@ -744,6 +751,8 @@ class BaseView:
         return True
     def isFiltable(self):
         return True
+    def onEvent(self,key):
+        return False
 class HelpView(BaseView):
     lines=['Help',
             'pgmon: an easy to use monitoring tool for PostgreSql, inspired by Linux\'s top and IBM\'s db2top',
@@ -751,7 +760,8 @@ class HelpView(BaseView):
             'Interactive commands',
             'h: print this screen',
             'd: database view,  list all databases',
-            's: session view, list all current sessions'
+            's: session view, list all current sessions',
+            '   k: kill/terminate a connection/backend',
             't: table view, list all user tables for a specified database',
             'i: index view, list all user index for a specified database',
             'l: locks view, list all locks for a specified session id',
@@ -870,6 +880,16 @@ class SessionView(BaseView,StatsListener):
     def setActive(self):
         StatsListener.setActive(self)
         return BaseView.setActive(self)
+    def onEvent(self,key):
+        if key=='k':
+            pid=self.getInput('please input the backend_id which you want to terminate: ')
+            if pid!='':
+                if self.collector.stats_pg.terminateBackend(pid):
+                    self.setMessage('backend %s terminated' % pid)
+                    self.refreshData()
+                else:
+                    self.setMessage('backend %s terminate failed' % pid)
+            return True
     def updateContent(self):
         if self.stats_modified or self.refresh_required:
             stats=self.getStats()
@@ -936,9 +956,11 @@ class CursesApp:
             self.currentView.setOrder()
         elif key == 'r': #manual data refresh
             if isinstance(self.currentView,StatsListener):
-                self.currentView.refreshData();
+                self.currentView.refreshData()
         elif key in self.views:
             self.setActiveView(key)
+        else:
+            self.currentView.onEvent(key)
     def setActiveView(self,view_name):
         if view_name in self.views and self.views[view_name].setActive():
             self.currentView=self.views[view_name]
