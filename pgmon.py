@@ -421,7 +421,7 @@ class PsStats:
                 with self.shareLock:
                     if pid in self.ps: # existing process
                         ov=self.ps[pid]
-                        nv['%CPU']= '%.1f' % (100.0 * (nv['cputimes'] - ov['cputimes']) / (nv['etimes'] - ov['etimes']) )
+                        nv['%CPU']= '%.1f' % (100.0 * (nv['cputimes'] - ov['cputimes']) / (0.000000000001 + nv['etimes'] - ov['etimes']) )
                     else:
                         nv['%CPU']= '0.0'
                 self.ps[pid]=nv
