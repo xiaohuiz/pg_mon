@@ -69,7 +69,7 @@ stats_items={
     'session':{'columns':['pid','cpu','mem','read','write','db','user','clt_app','clt_addr','bknd_age','xact_age','query_age','blking_id','locks','state','query'],
                 'formats':['s','.1f','.1f','.1f','.1f','s','s','s','s','s','s','s','s','s','s','float_s']
               },
-    'table': {'columns':['tbl_id','scm','tbl','tbl_sz','idx_sz','frzxid','seq_scn','idx_scn','tup_i','tup_u','tup_d','live_tup','dead_tup','lst_autovcm','lst_autoanz','a_vcm_n','a_anz_n'],
+    'table': {'columns':['tbl_id','scm','tbl','tbl_sz','idx_sz','xid_age','seq_scn','idx_scn','tup_i','tup_u','tup_d','live_tup','dead_tup','lst_autovcm','lst_autoanz','a_vcm_n','a_anz_n'],
             'formats':['s','s','s','s','s','s','s','s','s','s','s','s','s','s','s','s']
             },
     'index':{'columns':['scm_id','scm','tbl','idx','tbl_sz','idx_sz','idx_scn','idx_tup_rd'],
@@ -102,11 +102,11 @@ class PgStats:
                 )t
                 """,
             'table_list':"""
-                select st.relid,schemaname as scm, relname as tbl,  relpages*8,coalesce(indpages,0)*8,relfrozenxid,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,'' as autovcm_n,'' as  autoanz_n
+                select st.relid,schemaname as scm, relname as tbl,  relpages*8,coalesce(indpages,0)*8,xid_age,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,'' as autovcm_n,'' as  autoanz_n
                     from pg_stat_user_tables st,
-                ( select relid,t.relpages+coalesce(ts.relpages,0)+coalesce(ti.relpages,0) as relpages,indpages,t.relfrozenxid
+                ( select relid,t.relpages+coalesce(ts.relpages,0)+coalesce(ti.relpages,0) as relpages,indpages,t.xid_age
                     from
-                      (select oid as relid,relpages::bigint,relfrozenxid,reltoastrelid from pg_class where relkind='r') t
+                      (select oid as relid,relpages::bigint,age(relfrozenxid) as xid_age,reltoastrelid from pg_class where relkind='r') t
                       left outer join (select sum(relpages) as indpages,indrelid from pg_class i, pg_index r where relkind='i' and i.oid=r.indexrelid group by indrelid) i on t.relid=i.indrelid
                       left outer join pg_class ts on t.reltoastrelid=ts.oid
                       left outer join pg_class ti on ts.reltoastidxid=ti.oid
@@ -144,11 +144,11 @@ class PgStats:
                 left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.procpid=lc.pid
                 """,
             'table_list':"""
-                select st.relid,schemaname as scm, relname as tbl,  relpages*8,coalesce(indpages,0)*8,relfrozenxid,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
+                select st.relid,schemaname as scm, relname as tbl,  relpages*8,coalesce(indpages,0)*8,xid_age,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
                     from pg_stat_user_tables st,
-                ( select relid,t.relpages+coalesce(ts.relpages,0)+coalesce(ti.relpages,0) as relpages,indpages,t.relfrozenxid
+                ( select relid,t.relpages+coalesce(ts.relpages,0)+coalesce(ti.relpages,0) as relpages,indpages,t.xid_age
                     from
-                      (select oid as relid,relpages::bigint,relfrozenxid,reltoastrelid from pg_class where relkind='r') t
+                      (select oid as relid,relpages::bigint,age(relfrozenxid) as xid_age,reltoastrelid from pg_class where relkind='r') t
                       left outer join (select sum(relpages) as indpages,indrelid from pg_class i, pg_index r where relkind='i' and i.oid=r.indexrelid group by indrelid) i on t.relid=i.indrelid
                       left outer join pg_class ts on t.reltoastrelid=ts.oid
                       left outer join pg_class ti on ts.reltoastidxid=ti.oid
@@ -197,11 +197,11 @@ class PgStats:
                 )t
                 """,
             'table_list':
-                """select st.relid,schemaname as scm, relname as tbl,  relpages*8, coalesce(indpages,0)*8, relfrozenxid,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
+                """select st.relid,schemaname as scm, relname as tbl,  relpages*8, coalesce(indpages,0)*8, xid_age,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
                     from pg_stat_user_tables st,
-                ( select relid,t.relpages+coalesce(ts.relpages,0)+coalesce(ti.relpages,0) as relpages,indpages,t.relfrozenxid
+                ( select relid,t.relpages+coalesce(ts.relpages,0)+coalesce(ti.relpages,0) as relpages,indpages,t.xid_age
                     from
-                      (select oid as relid,relpages::bigint,relfrozenxid,reltoastrelid from pg_class where relkind='r') t
+                      (select oid as relid,relpages::bigint,age(relfrozenxid) as xid_age,reltoastrelid from pg_class where relkind='r') t
                       left outer join (select sum(relpages) as indpages,indrelid from pg_class i, pg_index r where relkind='i' and i.oid=r.indexrelid group by indrelid) i on t.relid=i.indrelid
                       left outer join pg_class ts on t.reltoastrelid=ts.oid
                       left outer join pg_class ti on ts.reltoastidxid=ti.oid
