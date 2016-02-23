@@ -916,7 +916,7 @@ class DBView(BaseView,StatsListener):
             stats=self.getStats()
             if 'ver' in stats:
                 if self.order_name!='':
-                    dbs=sorted(stats['db'].values(),key=lambda s:[self.order_name],reverse=True)
+                    dbs=sorted(stats['db'].values(),key=lambda s:s[self.order_name],reverse=True)
                 else:
                     dbs=stats['db'].values()
                 self.lines= formatPgStateLines(stats) + formatTable(dbs,stats_items['db']['columns'],stats_items['db']['formats'],self.filter_name)
