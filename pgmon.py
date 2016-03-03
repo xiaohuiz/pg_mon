@@ -1003,6 +1003,7 @@ class PgMonApp(CursesApp,StatsCollector):
 
 
 if __name__ == '__main__':
+    os.chdir('/tmp') #change current working directory to /tmp
     app=PgMonApp()
     def signal_handler(signal,frame):
         print('Ctrl+C received! exiting..')
