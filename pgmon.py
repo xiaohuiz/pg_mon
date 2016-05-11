@@ -447,6 +447,7 @@ class OsStats:
         self.disk_data_nm=''.join(re.findall('/([^/]+)$',self.disk_data))
         self.disk_wal=subprocess.check_output(['df',self.path_wal]).split('\n')[1].split()[0]
         self.disk_wal_nm=''.join(re.findall('/([^/]+)$',self.disk_wal))
+        self.host_nm=subprocess.check_output(['hostname']).split()[0]
         if has_psutil==False:
             self.tmp_file='/tmp/pgmon_psql_tmp_%s.txt' % datetime.datetime.now().strftime('%Y%m%d%H%M%s%f')
             self.fw_iostat=open(self.tmp_file, "wb")
@@ -458,6 +459,8 @@ class OsStats:
             self.data_rd=self.data_wt=self.data_utl=0.0
             self.wal_rd=self.wal_wt=self.wal_utl=0.0
             self.psstats=PsStats()
+    def getHostName(self):
+        return self.host_nm
     def __del__(self):
         if has_psutil==False:
             self.p_iostat.terminate()
@@ -593,7 +596,7 @@ class StatsCollector:
             stats_stg['write_data']=stats_stg['write_data_t']/1024
             stats_stg['read_wal']=stats_stg['read_wal_t']/1024
             stats_stg['write_wal']=stats_stg['write_wal_t']/1024
-        return {'ver':self.stats_pg.getPgVersion(),'up':self.stats_pg.getPgStartTime(),'cpu':self.stats_os.getCpuStats(),'memory':self.stats_os.getMemStats(),'storage':stats_stg,'streaming_rep':self.stats_pg.getRepStatus()}
+        return {'host':self.stats_os.getHostName(),'ver':self.stats_pg.getPgVersion(),'up':self.stats_pg.getPgStartTime(),'cpu':self.stats_os.getCpuStats(),'memory':self.stats_os.getMemStats(),'storage':stats_stg,'streaming_rep':self.stats_pg.getRepStatus()}
     def collectStats(self):
         def updatePsStatsToSession(pid,s):
             s.update(self.stats_os.getPsStats(int(pid)))
@@ -777,7 +780,7 @@ class HelpView(BaseView):
         return False
 def formatPgStateLines(stats):
     rep=stats['streaming_rep']
-    header=['pgmon - PostgreSQL version:%s,  started at %s  streaming rep mode: %s' % (stats['ver'],stats['up'],rep['rep_mod']),
+    header=['pgmon - postgres(%s) @ %s,  started at %s  streaming rep mode: %s' % (stats['ver'],stats['host'],stats['up'],rep['rep_mod']),
             'cpu: %5.1f idle, %5.1f iowait,  memory:  %s total,  %s free,  %s cached,  %s pg_share,  %s pg_private' % (stats['cpu']['idle'],stats['cpu']['iowait'],stats['memory']['total'],stats['memory']['free'],stats['memory']['cached'],stats['memory']['pg_share'],stats['memory']['pg_private']),
             'pg_data(%s): %sB/%s%% used,%8.1fread,%8.1fwrite;    pg_wal(%s): %sB/%s%% used,%8.1fread,%8.1fwrite' % (stats['storage']['disk_data'],stats['storage']['usage_data'],stats['storage']['usage_data%']*100,stats['storage']['read_data'],stats['storage']['write_data'],stats['storage']['disk_wal'],stats['storage']['usage_wal'],stats['storage']['usage_wal%']*100,stats['storage']['read_wal'],stats['storage']['write_wal'])
             ]
