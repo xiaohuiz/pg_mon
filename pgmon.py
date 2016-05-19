@@ -540,6 +540,19 @@ class OsStats:
             mem_shared,mem_private=reduce(lambda x,y: (x[0]+y[0],x[1]+y[1]),[getMemoryOfProcess(p) for p in ps_postgres if psutil.pid_exists(p.pid)])
         else:
             mem_shared,mem_private=0,0
+            pss,anon=0,0
+            #get postgres memory from smaps of all its processes
+            for procid in subprocess.check_output(['ps', '-upostgres', '-opid=']).split():
+                try:
+                    for line in open('/proc/'+procid+'/smaps','r'):
+                      words=line.split()
+                      if words[0]=='Pss:':
+                        pss+=int(words[1])
+                      elif words[0]=='Anonymous:':
+                        anon+=int(words[1])
+                except IOError:
+                    pass
+            mem_shared,mem_private = (pss-anon)*1024, anon*1024
         return {'total':bytes2human(self.vm_total),'cached':bytes2human(self.vm_cached),'free':bytes2human(self.vm_free),'pg_share':bytes2human(mem_shared),'pg_private':bytes2human(mem_private)}
 
 class StatsListener:
