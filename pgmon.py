@@ -99,6 +99,7 @@ class PgStats:
                     from pg_stat_activity s
                     left outer join lw on s.procpid=lw.waiting_id
                     left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.procpid=lc.pid
+                    where s.procpid<>pg_backend_pid()
                 )t
                 """,
             'table_list':"""
@@ -142,6 +143,7 @@ class PgStats:
                 from pg_stat_activity s
                 left outer join lw on s.procpid=lw.waiting_id
                 left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.procpid=lc.pid
+                where s.procpid<>pg_backend_pid()
                 """,
             'table_list':"""
                 select st.relid,schemaname as scm, relname as tbl,  relpages*8,coalesce(indpages,0)*8,xid_age,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
@@ -194,6 +196,7 @@ class PgStats:
                     from pg_stat_activity s
                     left outer join lw on s.pid=lw.waiting_id
                     left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.pid=lc.pid
+                    where s.pid<>pg_backend_pid()
                 )t
                 """,
             'table_list':
