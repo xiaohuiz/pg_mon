@@ -69,11 +69,11 @@ stats_items={
     'session':{'columns':['pid','cpu','mem','read','write','db','user','clt_app','clt_addr','bknd_age','xact_age','query_age','blking_id','locks','state','query'],
                 'formats':['s','.1f','.1f','.1f','.1f','s','s','s','s','s','s','s','s','s','s','float_s']
               },
-    'table': {'columns':['tbl_id','scm','tbl','tbl_sz','idx_sz','xid_age','seq_scn','idx_scn','tup_i','tup_u','tup_d','live_tup','dead_tup','lst_autovcm','lst_autoanz','a_vcm_n','a_anz_n'],
-            'formats':['s','s','s','s','s','s','s','s','s','s','s','s','s','s','s','s']
+    'table': {'columns':['tbl_id','scm','tbl','tbl_sz','idx_sz','xid_age','seq_scn','idx_scn','tup_i','tup_u','tup_d','live_tup','dead_tup','bloat_ratio','lst_autovcm','lst_autoanz','a_vcm_n','a_anz_n'],
+            'formats':['s','s','s','s','s','s','s','s','s','s','s','s','.2f','s','s','s','s']
             },
-    'index':{'columns':['scm_id','scm','tbl','idx','tbl_sz','idx_sz','idx_scn','idx_tup_rd'],
-            'formats':['s','s','s','s','s','s','s','s']
+    'index':{'columns':['scm_id','scm','tbl','idx','tbl_sz','idx_sz','n_tup','idx_scn','idx_tup_rd','bloat_ratio'],
+            'formats':['s','s','s','s','s','s','s','s','s','s']
             },
     'lock':{'columns':['pid','relname','locktype','mode','virtualxid','transactionid','granted','blocked_by'],
             'formats':['s','s','s','s','s','s','s','s']
@@ -81,6 +81,138 @@ stats_items={
     }
 
 class PgStats:
+    sqls_bloat={   #https://github.com/ioguix/pgsql-bloat-estimation
+        'table' : """
+            SELECT current_database(), schemaname, tblname, tblid, bs*tblpages AS real_size,
+              (tblpages-est_tblpages)*bs AS extra_size,
+              CASE WHEN tblpages - est_tblpages > 0
+                THEN 100 * (tblpages - est_tblpages)/tblpages::float
+                ELSE 0
+              END AS extra_ratio, fillfactor, (tblpages-est_tblpages_ff)*bs AS bloat_size,
+              CASE WHEN tblpages - est_tblpages_ff > 0
+                THEN 100 * (tblpages - est_tblpages_ff)/tblpages::float
+                ELSE 0
+              END AS bloat_ratio, is_na
+              -- , (pst).free_percent + (pst).dead_tuple_percent AS real_frag
+            FROM (
+              SELECT ceil( reltuples / ( (bs-page_hdr)/tpl_size ) ) + ceil( toasttuples / 4 ) AS est_tblpages,
+                ceil( reltuples / ( (bs-page_hdr)*fillfactor/(tpl_size*100) ) ) + ceil( toasttuples / 4 ) AS est_tblpages_ff,
+                tblpages, fillfactor, bs, tblid, schemaname, tblname, heappages, toastpages, is_na
+                -- , stattuple.pgstattuple(tblid) AS pst
+              FROM (
+                SELECT
+                  ( 4 + tpl_hdr_size + tpl_data_size + (2*ma)
+                    - CASE WHEN tpl_hdr_size%ma = 0 THEN ma ELSE tpl_hdr_size%ma END
+                    - CASE WHEN ceil(tpl_data_size)::int%ma = 0 THEN ma ELSE ceil(tpl_data_size)::int%ma END
+                  ) AS tpl_size, bs - page_hdr AS size_per_block, (heappages + toastpages) AS tblpages, heappages,
+                  toastpages, reltuples, toasttuples, bs, page_hdr, tblid, schemaname, tblname, fillfactor, is_na
+                FROM (
+                  SELECT
+                    tbl.oid AS tblid, ns.nspname AS schemaname, tbl.relname AS tblname, tbl.reltuples,
+                    tbl.relpages AS heappages, coalesce(toast.relpages, 0) AS toastpages,
+                    coalesce(toast.reltuples, 0) AS toasttuples,
+                    coalesce(substring(
+                      array_to_string(tbl.reloptions, ' ')
+                      FROM '%fillfactor=#"__#"%' FOR '#')::smallint, 100) AS fillfactor,
+                    current_setting('block_size')::numeric AS bs,
+                    CASE WHEN version()~'mingw32' OR version()~'64-bit|x86_64|ppc64|ia64|amd64' THEN 8 ELSE 4 END AS ma,
+                    24 AS page_hdr,
+                    23 + CASE WHEN MAX(coalesce(null_frac,0)) > 0 THEN ( 7 + count(*) ) / 8 ELSE 0::int END
+                      + CASE WHEN tbl.relhasoids THEN 4 ELSE 0 END AS tpl_hdr_size,
+                    sum( (1-coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 1024) ) AS tpl_data_size,
+                    bool_or(att.atttypid = 'pg_catalog.name'::regtype) AS is_na
+                  FROM pg_attribute AS att
+                    JOIN pg_class AS tbl ON att.attrelid = tbl.oid
+                    JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+                    JOIN pg_stats AS s ON s.schemaname=ns.nspname
+                      AND s.tablename = tbl.relname AND s.inherited=false AND s.attname=att.attname
+                    LEFT JOIN pg_class AS toast ON tbl.reltoastrelid = toast.oid
+                  WHERE att.attnum > 0 AND NOT att.attisdropped
+                    AND tbl.relkind = 'r'
+                  GROUP BY 1,2,3,4,5,6,7,8,9,10, tbl.relhasoids
+                  ORDER BY 2,3
+                ) AS s
+              ) AS s2
+            ) AS s3
+        """,
+        'index' : """
+            SELECT current_database(), nspname AS schemaname, tblname, table_oid as idxid, idxname, bs*(relpages)::bigint AS real_size,
+              bs*(relpages-est_pages)::bigint AS extra_size,
+              100 * (relpages-est_pages)::float / relpages AS extra_ratio,
+              fillfactor, bs*(relpages-est_pages_ff) AS bloat_size,
+              100 * (relpages-est_pages_ff)::float / relpages AS bloat_ratio,
+              is_na
+              -- , 100-(sub.pst).avg_leaf_density, est_pages, index_tuple_hdr_bm, maxalign, pagehdr, nulldatawidth, nulldatahdrwidth, sub.reltuples, sub.relpages -- (DEBUG INFO)
+            FROM (
+              SELECT coalesce(1 +
+                   ceil(reltuples/floor((bs-pageopqdata-pagehdr)/(4+nulldatahdrwidth)::float)), 0 -- ItemIdData size + computed avg size of a tuple (nulldatahdrwidth)
+                ) AS est_pages,
+                coalesce(1 +
+                   ceil(reltuples/floor((bs-pageopqdata-pagehdr)*fillfactor/(100*(4+nulldatahdrwidth)::float))), 0
+                ) AS est_pages_ff,
+                bs, nspname, table_oid, tblname, idxname, relpages, fillfactor, is_na
+                -- , stattuple.pgstatindex(quote_ident(nspname)||'.'||quote_ident(idxname)) AS pst, index_tuple_hdr_bm, maxalign, pagehdr, nulldatawidth, nulldatahdrwidth, reltuples -- (DEBUG INFO)
+              FROM (
+                SELECT maxalign, bs, nspname, tblname, idxname, reltuples, relpages, relam, table_oid, fillfactor,
+                  ( index_tuple_hdr_bm +
+                      maxalign - CASE -- Add padding to the index tuple header to align on MAXALIGN
+                        WHEN index_tuple_hdr_bm%maxalign = 0 THEN maxalign
+                        ELSE index_tuple_hdr_bm%maxalign
+                      END
+                    + nulldatawidth + maxalign - CASE -- Add padding to the data to align on MAXALIGN
+                        WHEN nulldatawidth = 0 THEN 0
+                        WHEN nulldatawidth::integer%maxalign = 0 THEN maxalign
+                        ELSE nulldatawidth::integer%maxalign
+                      END
+                  )::numeric AS nulldatahdrwidth, pagehdr, pageopqdata, is_na
+                  -- , index_tuple_hdr_bm, nulldatawidth -- (DEBUG INFO)
+                FROM (
+                  SELECT
+                    i.nspname, i.tblname, i.idxname, i.reltuples, i.relpages, i.relam, a.attrelid AS table_oid,
+                    current_setting('block_size')::numeric AS bs, fillfactor,
+                    CASE -- MAXALIGN: 4 on 32bits, 8 on 64bits (and mingw32 ?)
+                      WHEN version() ~ 'mingw32' OR version() ~ '64-bit|x86_64|ppc64|ia64|amd64' THEN 8
+                      ELSE 4
+                    END AS maxalign,
+                    /* per page header, fixed size: 20 for 7.X, 24 for others */
+                    24 AS pagehdr,
+                    /* per page btree opaque data */
+                    16 AS pageopqdata,
+                    /* per tuple header: add IndexAttributeBitMapData if some cols are null-able */
+                    CASE WHEN max(coalesce(s.null_frac,0)) = 0
+                      THEN 2 -- IndexTupleData size
+                      ELSE 2 + (( 32 + 8 - 1 ) / 8) -- IndexTupleData size + IndexAttributeBitMapData size ( max num filed per index + 8 - 1 /8)
+                    END AS index_tuple_hdr_bm,
+                    /* data len: we remove null values save space using it fractionnal part from stats */
+                    sum( (1-coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 1024)) AS nulldatawidth,
+                    max( CASE WHEN a.atttypid = 'pg_catalog.name'::regtype THEN 1 ELSE 0 END ) > 0 AS is_na
+                  FROM pg_attribute AS a
+                    JOIN (
+                      SELECT nspname, tbl.relname AS tblname, idx.relname AS idxname, idx.reltuples, idx.relpages, idx.relam,
+                        indrelid, indexrelid, indkey::smallint[] AS attnum,
+                        coalesce(substring(
+                          array_to_string(idx.reloptions, ' ')
+                           from 'fillfactor=([0-9]+)')::smallint, 90) AS fillfactor
+                      FROM pg_index
+                        JOIN pg_class idx ON idx.oid=pg_index.indexrelid
+                        JOIN pg_class tbl ON tbl.oid=pg_index.indrelid
+                        JOIN pg_namespace ON pg_namespace.oid = idx.relnamespace
+                      WHERE pg_index.indisvalid AND tbl.relkind = 'r' AND idx.relpages > 0
+                    ) AS i ON a.attrelid = i.indexrelid
+                    JOIN pg_stats AS s ON s.schemaname = i.nspname
+                      AND ((s.tablename = i.tblname AND s.attname = pg_catalog.pg_get_indexdef(a.attrelid, a.attnum, TRUE)) -- stats from tbl
+                      OR   (s.tablename = i.idxname AND s.attname = a.attname))-- stats from functionnal cols
+                    JOIN pg_type AS t ON a.atttypid = t.oid
+                  WHERE a.attnum > 0
+                  GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
+                ) AS s1
+              ) AS s2
+                JOIN pg_am am ON s2.relam = am.oid WHERE am.amname = 'btree'
+            ) AS sub
+            -- WHERE NOT is_na
+            ORDER BY 2,3,4
+        """
+    }
     sqls_all_vertions={
         '8.4':{
             'db_list':"""
@@ -200,7 +332,7 @@ class PgStats:
                 )t
                 """,
             'table_list':
-                """select st.relid,schemaname as scm, relname as tbl,  relpages*8, coalesce(indpages,0)*8, xid_age,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
+                """select st.relid,st.schemaname as scm, relname as tbl,  relpages*8, coalesce(indpages,0)*8, xid_age,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,b.bloat_ratio::int, last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
                     from pg_stat_user_tables st,
                 ( select relid,t.relpages+coalesce(ts.relpages,0)+coalesce(ti.relpages,0) as relpages,indpages,t.xid_age
                     from
@@ -208,13 +340,14 @@ class PgStats:
                       left outer join (select sum(relpages) as indpages,indrelid from pg_class i, pg_index r where relkind='i' and i.oid=r.indexrelid group by indrelid) i on t.relid=i.indrelid
                       left outer join pg_class ts on t.reltoastrelid=ts.oid
                       left outer join pg_class ti on ts.reltoastidxid=ti.oid
-                )p
-                where st.relid=p.relid
+                )p,
+                bloat b
+                where st.relid=p.relid and st.relid=b.tblid
                 """,
             'index_list':"""
-                select indexrelid,schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages*8 as tbl_sz, i.relpages*8 as idx_sz, idx_scan,idx_tup_read
-                from pg_stat_user_indexes st, pg_class r, pg_class i
-                where st.relid=r.oid and st.indexrelid=i.oid
+                select indexrelid,st.schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages*8 as tbl_sz, i.relpages*8 as idx_sz, i.reltuples::bigint as n_tup, idx_scan,idx_tup_read, b.bloat_ratio::int
+                from pg_stat_user_indexes st, pg_class r, pg_class i, bloat b
+                where st.relid=r.oid and st.indexrelid=i.oid and st.indexrelid=b.idxid
                 """,
             'lock_list':"""
                 select c.pid,relname,c.locktype,c.mode,c.virtualxid,c.transactionid,c.granted,h.pid as blocked_by
@@ -250,6 +383,8 @@ class PgStats:
     def __init__(self):
         self.psql=PgSql()
         self.sqls=self.sqls_all_vertions[re.findall('\d+\.\d+',self.getPgVersion())[0]]
+        self.sqls['table_list'] = 'with bloat as ( %s ) %s' % (re.sub('--.*\n', ' ',self.sqls_bloat['table']), self.sqls['table_list'])
+        self.sqls['index_list'] = 'with bloat as ( %s ) %s' % (re.sub('--.*\n', ' ',self.sqls_bloat['index']), self.sqls['index_list'])
         self.getRepMode()
     def getRepMode(self):
         rep_mod=''
@@ -307,7 +442,7 @@ class PgStats:
     def getTableList(self,db):
         tl={}
         for r in self.getSqlResult(self.sqls['table_list'],db):
-            tl[r[0]]=dict(zip(stats_items['table']['columns'],r[:3]+tuple([long(t) for t in r[3:13]])+r[13:15]+(long(r[15] if r[15]!='' else 0),(long(r[16] if r[16]!='' else 0)),)))
+            tl[r[0]]=dict(zip(stats_items['table']['columns'],r[:3]+tuple([long(t) for t in r[3:14]])+r[14:16]+(long(r[16] if r[16]!='' else 0),(long(r[17] if r[17]!='' else 0)),)))
         return tl
     def getIndexList(self,db):
         il={}
@@ -812,7 +947,7 @@ class IndexView(BaseView,StatsListener):
         BaseView.__init__(self,'i')
         StatsListener.__init__(self,'index')
     def getSortColumns(self):
-        return ['tbl_sz','idx_sz','idx_scn','idx_tup_rd']
+        return ['tbl_sz','idx_sz','n_tup','idx_scn','idx_tup_rd']
     def setActive(self):
         db=self.getInput('database name:')
         if len(db)>0:
