@@ -227,7 +227,7 @@ class PgStats:
                     where b.granted and not w.granted and w.pid<>b.pid and (w.transactionid=b.transactionid or (w.database=b.database and w.relation=b.relation))
                 )
                 select * from (
-                    select procpid as backend_id, datname as db, usename as user,'' as clt_app, client_addr as clt_addr,(now()-backend_start)::interval(0) backend_age,(now()-xact_start)::interval(0) as xact_age,(now()-query_start)::interval(0) query_age,lw.blocking_id,locks,'' as state,replace(replace(current_query,E'\n',''),E'\t','') as query
+                    select procpid as backend_id, datname as db, usename as user,'' as clt_app, client_addr as clt_addr,(now()-backend_start)::interval(0) backend_age,(now()-xact_start)::interval(0) as xact_age,case when state='active' then (now()-query_start)::interval(0) else null end as query_age,lw.blocking_id,locks,'' as state,replace(replace(current_query,E'\n',''),E'\t','') as query
                     from pg_stat_activity s
                     left outer join lw on s.procpid=lw.waiting_id
                     left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.procpid=lc.pid
@@ -271,7 +271,7 @@ class PgStats:
                     from pg_locks w,pg_locks b
                     where b.granted and not w.granted and w.pid<>b.pid and (w.transactionid=b.transactionid or (w.database=b.database and w.relation=b.relation))
                 )
-                select procpid as backend_id, datname as db, usename as user,application_name as clt_app, client_addr as clt_addr,(now()-backend_start)::interval(0) backend_age,(now()-xact_start)::interval(0) as xact_age,(now()-query_start)::interval(0) query_age,lw.blocking_id,locks,'' as state,replace(replace(current_query,E'\n',''),E'\t','') as query
+                select procpid as backend_id, datname as db, usename as user,application_name as clt_app, client_addr as clt_addr,(now()-backend_start)::interval(0) backend_age,(now()-xact_start)::interval(0) as xact_age,case when state='active' then (now()-query_start)::interval(0) else null end as query_age,lw.blocking_id,locks,'' as state,replace(replace(current_query,E'\n',''),E'\t','') as query
                 from pg_stat_activity s
                 left outer join lw on s.procpid=lw.waiting_id
                 left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.procpid=lc.pid
@@ -324,7 +324,7 @@ class PgStats:
                     where b.granted and not w.granted and w.pid<>b.pid and (w.transactionid=b.transactionid or (w.database=b.database and w.relation=b.relation))
                 )
                 select * from (
-                    select s.pid as backend_id, datname as db, usename as user,application_name as clt_app, client_addr as clt_addr,(now()-backend_start)::interval(0) backend_age,(now()-xact_start)::interval(0) as xact_age,(now()-query_start)::interval(0) query_age,lw.blocking_id,locks,state,replace(replace(query,E'\\n',''),E'\\t','') as query
+                    select s.pid as backend_id, datname as db, usename as user,application_name as clt_app, client_addr as clt_addr,(now()-backend_start)::interval(0) backend_age,(now()-xact_start)::interval(0) as xact_age,case when state='active' then (now()-query_start)::interval(0) else null end as query_age,lw.blocking_id,locks,state,replace(replace(query,E'\\n',''),E'\\t','') as query
                     from pg_stat_activity s
                     left outer join lw on s.pid=lw.waiting_id
                     left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.pid=lc.pid
