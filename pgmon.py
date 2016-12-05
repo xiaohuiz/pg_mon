@@ -726,6 +726,8 @@ class StatsListener:
         with self.shareLock:
             if self.collector!=None:
                 self.collector.refresh()
+    def getDbList(self):
+        return self.collector.getDbList()
 class StatsCollector:
     shareLock=threading.Lock()
     stopRequestEvent=threading.Event()
@@ -751,6 +753,12 @@ class StatsCollector:
             stats_stg['read_wal']=stats_stg['read_wal_t']/1024
             stats_stg['write_wal']=stats_stg['write_wal_t']/1024
         return {'host':self.stats_os.getHostName(),'ver':self.stats_pg.getPgVersion(),'up':self.stats_pg.getPgStartTime(),'cpu':self.stats_os.getCpuStats(),'memory':self.stats_os.getMemStats(),'storage':stats_stg,'streaming_rep':self.stats_pg.getRepStatus()}
+    def getDbList(self):
+        if 'db' not in self.stats:
+            dblist= self.stats_pg.getDbList()
+            with self.shareLock:
+                self.stats['db']=dblist
+        return self.stats['db']
     def collectStats(self):
         def updateStats(stats):
             with self.shareLock:
@@ -840,8 +848,9 @@ class BaseView:
     order_display=''
     order_name=''
     app=None
-    def __init__(self,activeKey):
+    def __init__(self,activeKey,title='view: '):
         self.activeKey=activeKey
+        self.title=title
     def setWin(self,app):
         self.app=app
         win = self.app.stdscr
@@ -919,12 +928,12 @@ class HelpView(BaseView):
             'r: refresh'
             ]
     def __init__(self):
-        BaseView.__init__(self,'h')
+        BaseView.__init__(self,'h','View help:')
     def isSortable(self):
         return False
     def isFiltable(self):
         return False
-def formatPgStateLines(stats):
+def formatPgStateLines(stats,title):
     rep=stats['streaming_rep']
     header=['pgmon - postgres(%s) @ %s,  started at %s  streaming rep mode: %s' % (stats['ver'],stats['host'],stats['up'],rep['rep_mod']),
             'cpu: %5.1f idle, %5.1f iowait,  memory:  %s total,  %s free,  %s cached,  %s pg_share,  %s pg_private' % (stats['cpu']['idle'],stats['cpu']['iowait'],stats['memory']['total'],stats['memory']['free'],stats['memory']['cached'],stats['memory']['pg_share'],stats['memory']['pg_private']),
@@ -935,20 +944,26 @@ def formatPgStateLines(stats):
             header.append('sync_clt:%s@%s state:%s/%s LSN:%s diffs(sent/flush/replay):%s/%s/%s' % (clt[1],clt[0],clt[3],clt[4],clt[5],clt[6],clt[7],clt[8]))
     elif rep['rep_mod']=='standby':
         header.append('rep: Standby last_xlog_rcv:%s last_xlog_replay:%s last_xlog_replay_time:%s' % (rep['rep_xlog_rcv_loc'],rep['rep_xlog_replay_loc'],rep['rep_xlog_replay_tm']))
-    header.append('')
+    header.append(title)
     return header
 class IndexView(BaseView,StatsListener):
     def __init__(self):
-        BaseView.__init__(self,'i')
+        BaseView.__init__(self,'i','Index')
         StatsListener.__init__(self,'index')
     def getSortColumns(self):
         return ['tbl_sz','idx_sz','n_tup','idx_scn','idx_tup_rd']
     def setActive(self):
-        db=self.getInput('database name:')
-        if len(db)>0:
-            self.dbName=db
-            StatsListener.setActive(self)
-            return BaseView.setActive(self)
+        dblist=self.getDbList()
+        if len(dblist) > 0:
+            default=dblist.keys()[0]
+            db=self.getInput('database name [%s]:' % default)
+            if len(db)==0:
+                db=default
+            if db in dblist:
+                self.dbName=db
+                self.title='Index list(%s):' % db
+                StatsListener.setActive(self)
+                return BaseView.setActive(self)
         return False
     def updateContent(self):
         if self.stats_modified or self.refresh_required:
@@ -958,7 +973,7 @@ class IndexView(BaseView,StatsListener):
                     indexs=sorted(stats['index'].values(),key=lambda s:s[self.order_name], reverse=True)
                 else:
                     indexs=stats['index'].values()
-                self.lines = formatPgStateLines(stats) + formatTable(indexs,stats_items['index']['columns'],stats_items['index']['formats'],self.filter_name)
+                self.lines = formatPgStateLines(stats,self.title) + formatTable(indexs,stats_items['index']['columns'],stats_items['index']['formats'],self.filter_name)
                 BaseView.updateContent(self)
 class TableView(BaseView,StatsListener):
     def __init__(self):
@@ -967,11 +982,17 @@ class TableView(BaseView,StatsListener):
     def getSortColumns(self):
         return ['tbl_sz','idx_sz','seq_scn','idx_scn','tup_i','tup_u','tup_d','live_tup','dead_tup']
     def setActive(self):
-        db=self.getInput('database name:')
-        if len(db)>0:
-            self.dbName=db
-            StatsListener.setActive(self)
-            return BaseView.setActive(self)
+        dblist=self.getDbList()
+        if len(dblist) > 0:
+            default=dblist.keys()[0]
+            db=self.getInput('database name [%s]:' % default)
+            if len(db)==0:
+                db=default
+            if db in dblist:
+                self.dbName=db
+                self.title='Table list(%s):' % db
+                StatsListener.setActive(self)
+                return BaseView.setActive(self)
         return False
     def updateContent(self):
         if self.stats_modified or self.refresh_required:
@@ -981,11 +1002,11 @@ class TableView(BaseView,StatsListener):
                     tables=sorted(stats['table'].values(),key=lambda s:s[self.order_name], reverse=True)
                 else:
                     tables=stats['table'].values()
-                self.lines = formatPgStateLines(stats) + formatTable(tables,stats_items['table']['columns'],stats_items['table']['formats'],self.filter_name)
+                self.lines = formatPgStateLines(stats,self.title) + formatTable(tables,stats_items['table']['columns'],stats_items['table']['formats'],self.filter_name)
                 BaseView.updateContent(self)
 class SessionDetailView(BaseView,StatsListener):
     def __init__(self):
-        BaseView.__init__(self,'l')
+        BaseView.__init__(self,'l','Session detail:')
         StatsListener.__init__(self,'session_detail')
     def getSortColumns(self):
         return ['tbl_sz','idx_sz','seq_scn','idx_scn','tup_i','tup_u','tup_d','live_tup','dead_tup']
@@ -993,6 +1014,7 @@ class SessionDetailView(BaseView,StatsListener):
         pid=self.getInput('backend id:')
         if len(pid)>0:
             self.pid=pid
+            self.title='Session detail(%s):' % pid
             StatsListener.setActive(self)
             return BaseView.setActive(self)
         return False
@@ -1000,7 +1022,7 @@ class SessionDetailView(BaseView,StatsListener):
         if self.stats_modified or self.refresh_required:
             stats=self.getStats()
             if 'ver' in stats:
-                self.lines = formatPgStateLines(stats)
+                self.lines = formatPgStateLines(stats,self.title)
                 if stats['session_detail']!=None:
                     sn=stats['session_detail']['session']
                     self.lines.append('session:'+self.pid)
@@ -1022,7 +1044,7 @@ def formatTable(rows,columns,formats,filter_raw):
             if len(filter)==0 or ((re.search(filter,l)!=None)!=invert)]
 class SessionView(BaseView,StatsListener):
     def __init__(self):
-        BaseView.__init__(self,'s')
+        BaseView.__init__(self,'s','Sessions:')
         StatsListener.__init__(self,'session')
     def getSortColumns(self):
         return ['cpu','mem','read','write','bknd_age','xact_age','query_age']
@@ -1049,11 +1071,11 @@ class SessionView(BaseView,StatsListener):
                     sessions=stats['session'].values()
                 for s in sessions:
                     s['query']=' '.join(s['query'].split())
-                self.lines = formatPgStateLines(stats) + formatTable(sessions,stats_items['session']['columns'],stats_items['session']['formats'],self.filter_name)
+                self.lines = formatPgStateLines(stats,self.title) + formatTable(sessions,stats_items['session']['columns'],stats_items['session']['formats'],self.filter_name)
                 BaseView.updateContent(self)
 class DBView(BaseView,StatsListener):
     def __init__(self):
-        BaseView.__init__(self,'d')
+        BaseView.__init__(self,'d','DB list:')
         StatsListener.__init__(self,'db')
     def getSortColumns(self):
         return ['size','sessions','tps','hit_ratio']
@@ -1068,7 +1090,7 @@ class DBView(BaseView,StatsListener):
                     dbs=sorted(stats['db'].values(),key=lambda s:s[self.order_name],reverse=True)
                 else:
                     dbs=stats['db'].values()
-                self.lines= formatPgStateLines(stats) + formatTable(dbs,stats_items['db']['columns'],stats_items['db']['formats'],self.filter_name)
+                self.lines= formatPgStateLines(stats,self.title) + formatTable(dbs,stats_items['db']['columns'],stats_items['db']['formats'],self.filter_name)
                 BaseView.updateContent(self)
 
 class CursesApp:
