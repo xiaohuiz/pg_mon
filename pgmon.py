@@ -667,13 +667,16 @@ class OsStats:
                 }
     def getCpuStats(self):
         return {'iowait':self.iowait,'idle':self.idle}
-    def getMemStats(self):
+    #get smaps is very slow in some situation, allow not extract postgres memory info
+    def getMemStats(self,includePGInfo=False):
         def getMemoryOfProcess(p):
             try:
                 return reduce(lambda x,y: (x[0]+y[0],x[1]+y[1]), [(m.pss,m.private_clean+m.private_dirty) for m in p.get_memory_maps()])
             except Exception:
                 return (0,0)
-        if has_psutil:
+        if not includePGInfo:
+            mem_shared,mem_private = 0,0
+        elif has_psutil:
             ps_postgres=[p for p in psutil.process_iter() if p.name()=='postgres']
             mem_shared,mem_private=reduce(lambda x,y: (x[0]+y[0],x[1]+y[1]),[getMemoryOfProcess(p) for p in ps_postgres if psutil.pid_exists(p.pid)])
         else:
@@ -749,6 +752,11 @@ class StatsCollector:
             stats_stg['write_wal']=stats_stg['write_wal_t']/1024
         return {'host':self.stats_os.getHostName(),'ver':self.stats_pg.getPgVersion(),'up':self.stats_pg.getPgStartTime(),'cpu':self.stats_os.getCpuStats(),'memory':self.stats_os.getMemStats(),'storage':stats_stg,'streaming_rep':self.stats_pg.getRepStatus()}
     def collectStats(self):
+        def updateStats(stats):
+            with self.shareLock:
+                self.stats.update(stats)
+                if self.active_statsName in self.stats:
+                    self.listners[self.active_statsName].updateStats(self.stats) 
         def updatePsStatsToSession(pid,s):
             s.update(self.stats_os.getPsStats(int(pid)))
             if last_stats_tm and pid in last_stats['session']:
@@ -759,49 +767,37 @@ class StatsCollector:
             else:
                 s['read']=s['read_t']/1024.0
                 s['write']=s['write_t']/1024.0
-        #print self.active_statsName
-        if self.active_statsName=='index':
-            db=self.listners[self.active_statsName].dbName
-            stats=self.getStatsState()
-            stats['index']=self.stats_pg.getIndexList(db)
-            with self.shareLock:
-                if self.active_statsName=='index':
-                    self.listners[self.active_statsName].updateStats(stats)
-        if self.active_statsName=='table':
-            db=self.listners[self.active_statsName].dbName
-            stats=self.getStatsState()
-            stats['table']=self.stats_pg.getTableList(db)
-            with self.shareLock:
-                if self.active_statsName=='table':
-                    self.listners[self.active_statsName].updateStats(stats)
-        if self.active_statsName=='db':
-            stats=self.getStatsState()
-            stats['db']=self.stats_pg.getDbList()
-            with self.shareLock:
-                #print 'in collecting:'
-                if self.active_statsName=='db':
-                    self.listners[self.active_statsName].updateStats(stats)
-        if self.active_statsName=='session':
+        #print self.active_statsName      
+        with self.shareLock:
+            self.refresh_requested=False
+        updateStats(self.getStatsState())
+        statsName=self.active_statsName
+        if statsName=='index':
+            db=self.listners[statsName].dbName
+            stats=self.stats_pg.getIndexList(db)
+        elif statsName=='table':
+            db=self.listners[statsName].dbName
+            stats=self.stats_pg.getTableList(db)
+        elif statsName=='db':
+            stats=self.stats_pg.getDbList()
+        elif statsName=='session':
             session_list=self.stats_pg.getSessionList()
-            last_stats_tm=self.listners[self.active_statsName].stats_tm
-            last_stats=self.listners[self.active_statsName].stats
+            last_stats_tm=self.listners[statsName].stats_tm
+            last_stats=self.listners[statsName].stats
             for pid,s in session_list.iteritems():  #append process stats cpu,mem,io
                 updatePsStatsToSession(pid,s)
-            stats=self.getStatsState()
-            stats['session']=session_list
-            with self.shareLock:
-                if self.active_statsName=='session':
-                    self.listners[self.active_statsName].updateStats(stats)
-        if self.active_statsName=='session_detail':
-            pid=self.listners[self.active_statsName].pid
-            stats=self.getStatsState()
-            stats['session_detail']=self.stats_pg.getSessionDetail(pid)
-            with self.shareLock:
-                if self.active_statsName=='session_detail':
-                    self.listners[self.active_statsName].updateStats(stats)
+            stats=session_list
+        elif statsName=='session_detail':
+            pid=self.listners[statsName].pid
+            stats=self.stats_pg.getSessionDetail(pid)
+        updateStats({statsName:stats})
+        #update memory again including postgresql memory info
+        updateStats({'memory':self.stats_os.getMemStats(True)})
+
     def __init__(self,updateInterval=600):
         self.stats_pg=PgStats()
         self.stats_os=OsStats(self.stats_pg.getPgPath())
+        self.stats={}
         self.updateInterval=updateInterval
         self.workerThread=threading.Thread(target=self.working)
         self.workerThread.start()
@@ -813,7 +809,6 @@ class StatsCollector:
             if self.refresh_requested or sleepDur>=self.updateInterval or self.active_statsName!=active_statsName:
                 sleepDur=0
                 active_statsName=self.active_statsName
-                self.refresh_requested=False
                 self.collectStats()
             sleepDur+=sleepInterval
             self.stopRequestEvent.wait(sleepInterval)
