@@ -400,7 +400,7 @@ class PgStats:
                     if 'sync_app_name' not in self.pg_settings:
                         fl_recovery_conf=os.path.join(self.getPgPath(),'recovery.conf')
                         conninfo=subprocess.check_output(['grep','primary_conninfo',fl_recovery_conf])
-                        self.pg_settings['sync_master']=re.findall('host=([\w\.]+) ', conninfo)[0]
+                        self.pg_settings['sync_master']=re.findall('host=([^\t ]+) ', conninfo)[0]
                         self.pg_settings['sync_app_name']=re.findall('application_name=([\w\-\.]+)', conninfo)[0]
             self.pg_settings['rep_mod']=rep_mod
         return rep_mod
@@ -410,7 +410,7 @@ class PgStats:
         elif self.getRepMode()=='standby':
             sql= "select pg_last_xlog_receive_location(),pg_last_xlog_replay_location(),pg_last_xact_replay_timestamp()::timestamp(0)::text"
             rep_status=self.getSqlResult(sql)
-            return {'rep_mod':'standby','rep_xlog_rcv_loc':rep_status[0][0],'rep_xlog_replay_loc':rep_status[0][1],'rep_xlog_replay_tm':rep_status[0][2]}
+            return {'rep_mod':'syncing via %s@%s' % (self.pg_settings['sync_app_name'],self.pg_settings['sync_master']),'rep_xlog_rcv_loc':rep_status[0][0],'rep_xlog_replay_loc':rep_status[0][1],'rep_xlog_replay_tm':rep_status[0][2]}
         else:
             return {'rep_mod':'standalone'}
     def getPgPath(self):
@@ -942,7 +942,7 @@ def formatPgStateLines(stats,title):
     if rep['rep_mod']=='master':
         for clt in rep['rep_list']:
             header.append('sync_clt:%s@%s state:%s/%s LSN:%s diffs(sent/flush/replay):%s/%s/%s' % (clt[1],clt[0],clt[3],clt[4],clt[5],clt[6],clt[7],clt[8]))
-    elif rep['rep_mod']=='standby':
+    elif rep['rep_mod']!='standalone':
         header.append('rep: Standby last_xlog_rcv:%s last_xlog_replay:%s last_xlog_replay_time:%s' % (rep['rep_xlog_rcv_loc'],rep['rep_xlog_replay_loc'],rep['rep_xlog_replay_tm']))
     header.append(title)
     return header
