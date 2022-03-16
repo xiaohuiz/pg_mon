@@ -1,6 +1,7 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 import datetime,re, os
 import subprocess,threading,signal
+from functools import reduce
 import curses
 try:
     import psutil
@@ -27,6 +28,16 @@ if "check_output" not in dir( subprocess ):
         retcode = process.poll()
         return output
     subprocess.check_output = f
+
+def check_process_output(*args,**kwargs):
+    try:
+        return subprocess.check_output(*args,**kwargs).decode("utf-8") 
+    except subprocess.CalledProcessError:
+        return ''
+
+def get_path_disk(path):
+    rs = check_process_output(['df', path]).split('\n')
+    return rs[1].split()[0] if len(rs) > 1 else 'n/a'
 
 import ctypes as c
 _get_dict = c.pythonapi._PyObject_GetDictPtr
@@ -60,7 +71,7 @@ class PgSql:
             self.cur.execute(sql)
             return self.cur.fetchall()
         else:
-            data=subprocess.check_output(['psql','-d%s'%dbName,'-c', r"copy (%s) to stdout with delimiter E'\t' NULL as ' -- '" % ' '.join(sql.split())])
+            data=check_process_output(['psql','-d%s'%dbName,'-c', r"copy (%s) to stdout with delimiter E'\t' NULL as ' -- '" % ' '.join(sql.split())]) 
             return [ tuple(line.split('\t')) for line in data.split('\n') if len(line)>0 ]
 stats_items={
     'db': {'columns':['db','size_pretty','sessions','xact_commit','tps','blks_hit','blks_read','hit_ratio','tup_iud','tup_returned'],
@@ -73,6 +84,9 @@ stats_items={
             'formats':['s','s','s','s','s','s','s','s','s','s','s','s','.2f','s','s','s','s']
             },
     'index':{'columns':['scm_id','scm','tbl','idx','tbl_sz','idx_sz','n_tup','idx_scn','idx_tup_rd','bloat_ratio'],
+            'formats':['s','s','s','s','s','s','s','s','s','s']
+            },
+    'vacuum':{'columns':['pid','duration','table','phrase', 'heap_blks_total', 'scaned_p', 'heap_blks_vacuumed', 'index_vacuum_count', 'max_dead_tuples', 'num_dead_tuples'],
             'formats':['s','s','s','s','s','s','s','s','s','s']
             },
     'lock':{'columns':['pid','relname','locktype','mode','virtualxid','transactionid','granted','blocked_by'],
@@ -214,6 +228,56 @@ class PgStats:
         """
     }
     sqls_all_vertions={
+        'default': {
+            'db_list':"""
+                select extract(epoch from now()) as now,datname as db,pg_database_size(datname) as size,numbackends as sessions,xact_commit,xact_rollback,blks_hit,blks_read,(tup_inserted+tup_updated+tup_deleted) as tup_iud,tup_returned
+                from pg_stat_database
+                where datname not in ('template0','template1','postgres')
+                """,
+            'table_list':
+                """select st.relid,st.schemaname as scm, st.relname as tbl, pg_table_size(st.relid)/1024 as relpages, pg_indexes_size(st.relid)/1024 as indpages, age(c.relfrozenxid) as xid_age,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup, b.bloat_ratio::int, last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
+                from pg_stat_user_tables st, pg_class c, bloat b
+                where st.relid=c.oid and st.relid=b.tblid
+                """,
+            'rep_list':"""
+                select client_addr,application_name,usename,sync_state,state,pg_current_wal_lsn() as cur_location,pg_wal_lsn_diff(sent_lsn, pg_current_wal_lsn()) as sent_dif,flush_lag as flush_dif, replay_lag as replay_dif
+                from  pg_stat_replication
+                """,
+            'session_list':"""
+                with lw as(
+                    select w.pid as waiting_id,b.pid as blocking_id
+                    from pg_locks w,pg_locks b
+                    where b.granted and not w.granted and w.pid<>b.pid and (w.transactionid=b.transactionid or (w.database=b.database and w.relation=b.relation))
+                )
+                select * from (
+                    select s.pid as backend_id, datname as db, usename as user,application_name as clt_app, client_addr as clt_addr,(now()-backend_start)::interval(0) backend_age,(now()-xact_start)::interval(0) as xact_age,case when state='active' then (now()-query_start)::interval(0) else null end as query_age,lw.blocking_id,locks,state,replace(replace(query,E'\\n',''),E'\\t','') as query
+                    from pg_stat_activity s
+                    left outer join lw on s.pid=lw.waiting_id
+                    left outer join (select pid,count(1) as locks from pg_locks group by pid) lc on s.pid=lc.pid
+                    where s.pid<>pg_backend_pid()
+                )t
+                """,
+            'index_list':"""
+                select indexrelid,st.schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages*8 as tbl_sz, i.relpages*8 as idx_sz, i.reltuples::bigint as n_tup, idx_scan,idx_tup_read, b.bloat_ratio::int
+                from pg_stat_user_indexes st, pg_class r, pg_class i, bloat b
+                where st.relid=r.oid and st.indexrelid=i.oid and st.indexrelid=b.idxid
+                """,
+            'vacuum_list':"""
+                select a.pid, date_trunc('second',current_timestamp-xact_start) as dur, relname,phase,heap_blks_total, heap_blks_scanned*100/heap_blks_total as scaned_p, heap_blks_vacuumed,index_vacuum_count,max_dead_tuples,num_dead_tuples 
+                from pg_stat_progress_vacuum v, pg_stat_activity a, pg_class c 
+                where v.pid=a.pid and v.relid=c.oid
+                """,
+            'lock_list':"""
+                select c.pid,relname,c.locktype,c.mode,c.virtualxid,c.transactionid,c.granted,h.pid as blocked_by
+                from pg_locks c
+                    left outer join pg_locks h on h.granted and not c.granted and (h.transactionid=c.transactionid or (h.database=c.database and h.relation=c.relation))
+                    left outer join pg_class r on c.relation=r.oid
+                where c.pid=
+                """,
+            'inst': """
+                select checkpoints_timed, checkpoints_req, (select count(1) from pg_stat_activity) as connections, pg_postmaster_start_time()::date as up from pg_stat_bgwriter
+            """
+        },
         '8.4':{
             'db_list':"""
                 select extract(epoch from now()) as now,datname as db,pg_database_size(datname) as size,numbackends as sessions,xact_commit,xact_rollback,blks_hit,blks_read,(tup_inserted+tup_updated+tup_deleted) as tup_iud,tup_returned
@@ -344,11 +408,6 @@ class PgStats:
                 bloat b
                 where st.relid=p.relid and st.relid=b.tblid
                 """,
-            'index_list':"""
-                select indexrelid,st.schemaname as scm,st.relname as tbl,indexrelname as idx,r.relpages*8 as tbl_sz, i.relpages*8 as idx_sz, i.reltuples::bigint as n_tup, idx_scan,idx_tup_read, b.bloat_ratio::int
-                from pg_stat_user_indexes st, pg_class r, pg_class i, bloat b
-                where st.relid=r.oid and st.indexrelid=i.oid and st.indexrelid=b.idxid
-                """,
             'lock_list':"""
                 select c.pid,relname,c.locktype,c.mode,c.virtualxid,c.transactionid,c.granted,h.pid as blocked_by
                 from pg_locks c
@@ -372,6 +431,17 @@ class PgStats:
                     )t1
                 )t2
                 """
+        },
+        '10.18': {
+            'table_list':
+                """select st.relid,st.schemaname as scm, st.relname as tbl, pg_table_size(st.relid)/1024 as relpages, pg_indexes_size(st.relid)/1024 as indpages, age(c.relfrozenxid) as xid_age,coalesce(seq_scan,0),coalesce(idx_scan,0),n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup, b.bloat_ratio::int, last_autovacuum::timestamp(0) as lst_autovcm, last_autoanalyze::timestamp(0) as lst_autoanz,autovacuum_count as autovcm_n,autoanalyze_count as  autoanz_n
+                from pg_stat_user_tables st, pg_class c, bloat b
+                where st.relid=c.oid and st.relid=b.tblid
+                """,
+            'rep_list':"""
+                select client_addr,application_name,usename,sync_state,state,pg_current_wal_lsn() as cur_location,pg_wal_lsn_diff(sent_lsn, pg_current_wal_lsn()) as sent_dif,flush_lag as flush_dif, replay_lag as replay_dif
+                from  pg_stat_replication
+                """
         }
     }
     db_list={}
@@ -382,7 +452,15 @@ class PgStats:
         return self.psql.getSqlResult(sql,db)
     def __init__(self):
         self.psql=PgSql()
-        self.sqls=self.sqls_all_vertions[re.findall('\d+\.\d+',self.getPgVersion())[0]]
+        self.version = re.findall('\d+\.\d+',self.getPgVersion())[0]
+        defaults = self.sqls_all_vertions['default']
+        if self.version in self.sqls_all_vertions:
+            self.sqls=self.sqls_all_vertions[self.version]
+            for cmd in defaults: # add default sql
+                if cmd not in self.sqls:
+                    self.sqls[cmd] = defaults[cmd]
+        else:
+            self.sqls = defaults
         self.sqls['table_list'] = 'with bloat as ( %s ) %s' % (re.sub('--.*\n', ' ',self.sqls_bloat['table']), self.sqls['table_list'])
         self.sqls['index_list'] = 'with bloat as ( %s ) %s' % (re.sub('--.*\n', ' ',self.sqls_bloat['index']), self.sqls['index_list'])
         self.getRepMode()
@@ -399,7 +477,7 @@ class PgStats:
                     rep_mod='standby'
                     if 'sync_app_name' not in self.pg_settings:
                         fl_recovery_conf=os.path.join(self.getPgPath(),'recovery.conf')
-                        conninfo=subprocess.check_output(['grep','primary_conninfo',fl_recovery_conf])
+                        conninfo=check_process_output(['grep','primary_conninfo',fl_recovery_conf]) 
                         self.pg_settings['sync_master']=re.findall('host=([^\t ]+) ', conninfo)[0]
                         self.pg_settings['sync_app_name']=re.findall('application_name=([\w\-\.]+)', conninfo)[0]
             self.pg_settings['rep_mod']=rep_mod
@@ -428,27 +506,40 @@ class PgStats:
             self.pg_settings['data_directory']=path_data
             self.pg_settings['bin_directory']=path_bin
         return self.pg_settings['data_directory']
+    def getWalPath(self):
+        pgPath = self.getPgPath()
+        return pgPath + ('/pg_xlog' if float(self.version) < 10 else '/pg_wal')
     def getPgVersion(self):
         if 'version' not in self.pg_settings:
             pg_data=self.getPgPath()
-            pg_ver=self.getSqlResult(r"select substring(version() from E'PostgreSQL ([^ ]+) on')")[0][0]
+            pg_ver=self.getSqlResult(r"select substring(version() from E'PostgreSQL ([^ ]+) ')")[0][0]
             self.pg_settings['version']=pg_ver
         return self.pg_settings['version']
-    def getPgStartTime(self):
-        if 'start_time' not in self.pg_settings:
-            sql_start_time="SELECT pg_postmaster_start_time()::timestamp(0)"
-            self.pg_settings['start_time']=self.getSqlResult(sql_start_time)[0][0]
-        return self.pg_settings['start_time']
+    def getInstanceStats(self):
+        rs = self.getSqlResult(self.sqls['inst'])
+        if len(rs) > 0:
+            checkpoints_timed = int(rs[0][0])
+            checkpoints_req = int(rs[0][1])
+            connections = int(rs[0][2])
+            checkpoints_timed_p = int((checkpoints_timed*100) / (checkpoints_timed + checkpoints_req)) if checkpoints_timed > 0 else 100
+            start_time = rs[0][3]
+            return {'connections': connections, 'checkpoints_timed_p': checkpoints_timed_p, 'start_time': start_time}
+        return {'connections': 'n/a', 'checkpoints_timed_p': 'n/a'}
     def getTableList(self,db):
         tl={}
         for r in self.getSqlResult(self.sqls['table_list'],db):
-            tl[r[0]]=dict(zip(stats_items['table']['columns'],r[:3]+tuple([long(t) for t in r[3:14]])+r[14:16]+(long(r[16] if r[16]!='' else 0),(long(r[17] if r[17]!='' else 0)),)))
+            tl[r[0]]=dict(zip(stats_items['table']['columns'],r[:3]+tuple([int(t) for t in r[3:14]])+r[14:16]+(int(r[16] if r[16]!='' else 0),(int(r[17] if r[17]!='' else 0)),)))
         return tl
     def getIndexList(self,db):
         il={}
         for r in self.getSqlResult(self.sqls['index_list'],db):
-            il[r[0]]=dict(zip(stats_items['index']['columns'],r[:4]+tuple([long(t) for t in r[4:]])))
+            il[r[0]]=dict(zip(stats_items['index']['columns'],r[:4]+tuple([int(t) for t in r[4:]])))
         return il
+    def getVacuumList(self, db):
+        vl = {}
+        for r in self.getSqlResult(self.sqls['vacuum_list'],db):
+            vl[r[0]]=dict(zip(stats_items['vacuum']['columns'],r[:4]+tuple([int(t) for t in r[4:]])))
+        return vl
     def getLockList(self,db,pid):
         rows=self.getSqlResult(self.sqls['lock_list']+str(pid),db)
         return [dict(zip(stats_items['lock']['columns'],r)) for r in rows]
@@ -472,10 +563,10 @@ class PgStats:
         #self.i+=1
         db_list={}#'i':self.i}
         for db in self.getSqlResult(self.sqls['db_list']):
-            db_list[db[1]]={'db':db[1],'snap_tm':float(db[0]),'size':long(db[2]),'size_pretty':bytes2human(long(db[2])),'sessions':int(db[3]),'xact_commit':long(db[4]),'xact_rollback':long(db[5]),'blks_hit':long(db[6]),'blks_read':long(db[7]),'tup_iud':long(db[8]),'tup_returned':long(db[9])}
+            db_list[db[1]]={'db':db[1],'snap_tm':float(db[0]),'size':int(db[2]),'size_pretty':bytes2human(int(db[2])),'sessions':int(db[3]),'xact_commit':int(db[4]),'xact_rollback':int(db[5]),'blks_hit':int(db[6]),'blks_read':int(db[7]),'tup_iud':int(db[8]),'tup_returned':int(db[9])}
             delt_tm=db_list[db[1]]['snap_tm']-self.db_list[db[1]]['snap_tm'] if db[1] in self.db_list else 0
             db_list[db[1]]['tps'] = (db_list[db[1]]['xact_commit']-self.db_list[db[1]]['xact_commit'])/delt_tm if delt_tm>0 else 0
-            db_list[db[1]]['hit_ratio']=db_list[db[1]]['blks_hit']*100/(db_list[db[1]]['blks_hit']+db_list[db[1]]['blks_read']) if db_list[db[1]]['blks_hit']+db_list[db[1]]['blks_read']>0 else 0
+            db_list[db[1]]['hit_ratio']=int(db_list[db[1]]['blks_hit']*100/(db_list[db[1]]['blks_hit']+db_list[db[1]]['blks_read'])) if db_list[db[1]]['blks_hit']+db_list[db[1]]['blks_read']>0 else 0
             delt_hit=db_list[db[1]]['blks_hit']-self.db_list[db[1]]['blks_hit'] if db[1] in self.db_list else 0
             delt_read=db_list[db[1]]['blks_read']-self.db_list[db[1]]['blks_read'] if db[1] in self.db_list else 0
             db_list[db[1]]['hit_ratio_delt']=delt_hit*100/(delt_hit+delt_read) if delt_hit+delt_read>0 else db_list[db[1]]['hit_ratio']
@@ -485,7 +576,7 @@ class PgStats:
     def getPgControlData(self):
         pg_data=self.getPgPath()
         pg_bin=self.pg_settings['bin_directory']
-        ctl_data=subprocess.check_output([pg_bin+'/pg_controldata', pg_data])
+        ctl_data=check_process_output([pg_bin+'/pg_controldata', pg_data]) 
         pg_state=re.findall('Database cluster state: +(.+)\n',ctl_data)
         last_checkpoint_tm=re.findall('Time of latest checkpoint: +(.+)\n',ctl_data)
         return {'pg_state':pg_state[0],'last_checkpoint_tm':last_checkpoint_tm[0]}
@@ -495,9 +586,10 @@ class PgStats:
         try:
             lbl_data=open(pg_data+'/backup_label').readlines()  #lable file exists, backup in processing
         except IOError:
-            lbl_fls=[f for f in os.listdir(pg_data+'/pg_xlog') if f.endswith('.backup')]
+            wal_path = self.getWalPath()
+            lbl_fls=[f for f in os.listdir(wal_path) if f.endswith('.backup')]
             if len(lbl_fls)>0:
-                lbl_data=lbl_data=open(pg_data+'/pg_xlog/'+lbl_fls[0]).readlines()
+                lbl_data=lbl_data=open(wal_path+'/'+lbl_fls[0]).readlines()
         lbl=''.join(re.findall('LABEL: (.+)$',lbl_data))
         start=''.join(re.findall('START TIME: (.+)$',lbl_data))
         stop=''.join(re.findall('STOP TIME: (.+)$',lbl_data))
@@ -508,9 +600,9 @@ class PgStats:
         status=''
         lag=0
         if len(ps)>0:
-            pg_data=self.getPgPath()
+            wal_path = self.getWalPath()
             status=re.findall('postgres: archiver process +(.+)',ps[0])[0]
-            lag=len([f for f in os.listdir(pg_data+'/pg_xlog/archive_status') if f.endswith('.ready')])
+            lag=len([f for f in os.listdir(wal_path+'/archive_status') if f.endswith('.ready')])
         return {'status':status,'lag':lag}
 def bytes2human(n):
     # http://code.activestate.com/recipes/578019
@@ -518,6 +610,8 @@ def bytes2human(n):
     # '9.8K'
     # >>> bytes2human(100001221)
     # '95.4M'
+    if n == 'n/a':
+        return 'n/a'
     symbols = ('K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y')
     prefix = {}
     for i, s in enumerate(symbols):
@@ -539,11 +633,13 @@ class PsStats:
         self.shareLock=threading.Lock()
         self.ps={}
         self.stopRequestEvent=threading.Event()
-        self.thd_ps=threading.Thread(target=self.background_worker)
+        self.thd_ps=threading.Thread(target=self.background_worker, daemon=True)
         self.thd_ps.start()
     @staticmethod
     def getPs(user):
-        ps=[p.split() for p in subprocess.check_output(('ps -u '+user+' -o pid,cputime,etime,stat,%mem,command').split()).split('\n') if len(p)>3]
+        ps=[p.split() for p in check_process_output(('ps -u '+user+' -o pid,cputime,etime,stat,%mem,command').split()) .split('\n') if len(p)>3]
+        if len(ps) < 1:
+            raise Exception('No postgres processes founed, please make sure postgres is running!') 
         nms=ps[0] # PID     TIME     ELAPSED STAT %MEM COMMAND
         return [ {'PID':p[0], 'TIME':p[1], 'ELAPSED':p[2], 'STAT':p[3], '%MEM':p[4], 'COMMAND':' '.join(p[5:])} for p in ps[1:]]
     def background_worker(self):
@@ -578,19 +674,19 @@ class PsStats:
 
 class OsStats:
     #io_pre=psutil.disk_io_counters(True)
-    def __init__(self,path_data):
+    def __init__(self,path_data, path_wal):
         self.path_data=path_data
-        self.path_wal=path_data+'/pg_xlog/'
-        self.disk_data=subprocess.check_output(['df',self.path_data]).split('\n')[1].split()[0]
+        self.path_wal=path_wal
+        self.disk_data=get_path_disk(self.path_data)
         self.disk_data_nm=''.join(re.findall('/([^/]+)$',self.disk_data))
-        self.disk_wal=subprocess.check_output(['df',self.path_wal]).split('\n')[1].split()[0]
+        self.disk_wal=get_path_disk(self.path_wal)
         self.disk_wal_nm=''.join(re.findall('/([^/]+)$',self.disk_wal))
-        self.host_nm=subprocess.check_output(['hostname']).split()[0]
+        self.host_nm=check_process_output(['hostname']).split()[0]
         if has_psutil==False:
             self.tmp_file='/tmp/pgmon_psql_tmp_%s.txt' % datetime.datetime.now().strftime('%Y%m%d%H%M%s%f')
             self.fw_iostat=open(self.tmp_file, "wb")
             self.f_iostat=open(self.tmp_file,'r')
-            self.p_iostat = subprocess.Popen(["iostat","-xk","2"], stdout = self.fw_iostat, stderr = self.fw_iostat, bufsize = 1)
+            self.p_iostat = subprocess.Popen(["iostat","-xk","2", "36000"], stdout = self.fw_iostat, stderr = self.fw_iostat, bufsize = 1) # max 20 hours
             self.re_io=re.compile('\n(\w+(\s+[\d\.]+)+)')
             self.re_cpu=re.compile('\n((\s+[\d\.]+){6})')
             self.iowait=self.idle=0.0
@@ -604,7 +700,7 @@ class OsStats:
             self.p_iostat.terminate()
             self.fw_iostat.close()
             self.f_iostat.close()
-            subprocess.check_output("rm /tmp/pgmon_psql_tmp_*",shell=True)
+            check_process_output("rm /tmp/pgmon_psql_tmp_*",shell=True)
             self.psstats.stop()
             del self.psstats
     def update(self):
@@ -624,8 +720,8 @@ class OsStats:
             wt_wal=io_cur[disk_nm].write_bytes#(io_cur[self.disk_wal].write_bytes-io_pre[self.disk_wal].write_bytes)/(io_cur[self.disk_wal].write_time-io_pre[self.disk_wal].write_time)*1000/1024/1024 if io_cur[self.disk_wal].write_time-io_pre[self.disk_wal].write_time>0 else 0
             rd_wal=io_cur[disk_nm].read_bytes#(io_cur[self.disk_wal].read_bytes-io_pre[self.disk_wal].read_bytes)/(io_cur[self.disk_wal].read_time-io_pre[self.disk_wal].read_time)*1000/1024/1024 if io_cur[self.disk_wal].read_time-io_pre[self.disk_wal].read_time>0 else 0
         else:
-            vm=subprocess.check_output(['free']).split('\n')[1].split()
-            self.vm_total,self.vm_cached,self.vm_free=long(vm[1])*1024,long(vm[6])*1024,long(vm[3])*1024
+            vm=check_process_output(['free']).split('\n')[1].split()
+            self.vm_total,self.vm_cached,self.vm_free=int(vm[1])*1024,int(vm[6])*1024,int(vm[3])*1024
             iostat=self.f_iostat.read()
             cs=self.re_cpu.findall(iostat)
             if len(cs)>0:
@@ -646,11 +742,12 @@ class OsStats:
             usage=psutil.disk_usage(self.path_wal)
             self.wal_used,self.wal_percent=usage.used,usage.percent
         else:
-            for df in [d.split() for d in subprocess.check_output(['df']).split('\n')[1:] if len(d)>6]:
+            self.data_used, self.data_percent, self.wal_used, self.wal_percent = 'n/a', 0, 'n/a', 0
+            for df in [d.split() for d in check_process_output(['df']).split('\n')[1:] if len(d)>6]:
                 if df[0]==self.disk_data:
-                    self.data_used,self.data_percent=long(df[2])*1024,float(df[4][:-1])/100
+                    self.data_used,self.data_percent=int(df[2])*1024,float(df[4][:-1])/100
                 if df[0]==self.disk_wal:
-                    self.wal_used,self.wal_percent=long(df[2])*1024,float(df[4][:-1])/100
+                    self.wal_used,self.wal_percent=int(df[2])*1024,float(df[4][:-1])/100
     def getPsStats(self,pid):
         if has_psutil:
             try:
@@ -683,7 +780,7 @@ class OsStats:
             mem_shared,mem_private=0,0
             pss,anon=0,0
             #get postgres memory from smaps of all its processes
-            for procid in subprocess.check_output(['ps', '-upostgres', '-opid=']).split():
+            for procid in check_process_output(['ps', '-upostgres', '-opid=']).split():
                 try:
                     for line in open('/proc/'+procid+'/smaps','r'):
                       words=line.split()
@@ -731,10 +828,6 @@ class StatsListener:
 class StatsCollector:
     shareLock=threading.Lock()
     stopRequestEvent=threading.Event()
-    active_statsName = ''
-    listners={}
-    workerThread=None
-    refresh_requested=False
     def getStatsState(self):
         self.stats_os.update()
         last_stats_tm=self.listners[self.active_statsName].stats_tm
@@ -752,7 +845,8 @@ class StatsCollector:
             stats_stg['write_data']=stats_stg['write_data_t']/1024
             stats_stg['read_wal']=stats_stg['read_wal_t']/1024
             stats_stg['write_wal']=stats_stg['write_wal_t']/1024
-        return {'host':self.stats_os.getHostName(),'ver':self.stats_pg.getPgVersion(),'up':self.stats_pg.getPgStartTime(),'cpu':self.stats_os.getCpuStats(),'memory':self.stats_os.getMemStats(),'storage':stats_stg,'streaming_rep':self.stats_pg.getRepStatus()}
+        inst_stats = self.stats_pg.getInstanceStats()
+        return {'host':self.stats_os.getHostName(),'ver':self.stats_pg.getPgVersion(),'up':inst_stats['start_time'],'cpu':self.stats_os.getCpuStats(),'memory':self.stats_os.getMemStats(),'storage':stats_stg,'streaming_rep':self.stats_pg.getRepStatus(), 'checkpoints_timed': inst_stats['checkpoints_timed_p'], 'connections': inst_stats['connections']}
     def getDbList(self):
         if 'db' not in self.stats:
             dblist= self.stats_pg.getDbList()
@@ -783,6 +877,9 @@ class StatsCollector:
         if statsName=='index':
             db=self.listners[statsName].dbName
             stats=self.stats_pg.getIndexList(db)
+        if statsName == 'vacuum':
+            db=self.listners[statsName].dbName
+            stats=self.stats_pg.getVacuumList(db)
         elif statsName=='table':
             db=self.listners[statsName].dbName
             stats=self.stats_pg.getTableList(db)
@@ -792,7 +889,7 @@ class StatsCollector:
             session_list=self.stats_pg.getSessionList()
             last_stats_tm=self.listners[statsName].stats_tm
             last_stats=self.listners[statsName].stats
-            for pid,s in session_list.iteritems():  #append process stats cpu,mem,io
+            for pid,s in session_list.items():  #append process stats cpu,mem,io
                 updatePsStatsToSession(pid,s)
             stats=session_list
         elif statsName=='session_detail':
@@ -801,13 +898,15 @@ class StatsCollector:
         updateStats({statsName:stats})
         #update memory again including postgresql memory info
         updateStats({'memory':self.stats_os.getMemStats(True)})
-
     def __init__(self,updateInterval=600):
         self.stats_pg=PgStats()
-        self.stats_os=OsStats(self.stats_pg.getPgPath())
+        self.stats_os=OsStats(self.stats_pg.getPgPath(), self.stats_pg.getWalPath())
         self.stats={}
+        self.listners={}
+        self.active_statsName = ''
+        self.refresh_requested=False
         self.updateInterval=updateInterval
-        self.workerThread=threading.Thread(target=self.working)
+        self.workerThread=threading.Thread(target=self.working, daemon=True)
         self.workerThread.start()
     def working(self):
         sleepInterval=0.5
@@ -822,13 +921,13 @@ class StatsCollector:
             self.stopRequestEvent.wait(sleepInterval)
     def __del__(self):
         self.stop()
+        del self.stats_os
+        del self.stats_pg
     def stop(self):
         if self.workerThread:
             self.stopRequestEvent.set()
             self.workerThread.join()
             self.workerThread=None
-        del self.stats_os
-        del self.stats_pg
     def addListener(self,listener):
         with self.shareLock:
             self.listners[listener.statsName]=listener
@@ -881,7 +980,7 @@ class BaseView:
         win.clrtoeol()
         win.addstr(self.height-1,0,initial)
         win.timeout(-1) #disable read timeout
-        input=win.getstr(self.height-1,len(initial)+1)
+        input=win.getstr(self.height-1,len(initial)+1).decode("utf-8")
         win.timeout(self.app.loopInterval)
         curses.curs_set(0)
         curses.noecho()
@@ -924,6 +1023,7 @@ class HelpView(BaseView):
             'i: index view, list all user index for a specified database',
             'l: locks view, list all locks for a specified session id',
             'b: background writer view, show stats about background writer',
+            'v: tables currently in vacuum progress',
             '/: filter current view via regex, start with "! " for invert match',
             'r: refresh'
             ]
@@ -935,9 +1035,9 @@ class HelpView(BaseView):
         return False
 def formatPgStateLines(stats,title):
     rep=stats['streaming_rep']
-    header=['pgmon - postgres(%s) @ %s,  started at %s  streaming rep mode: %s' % (stats['ver'],stats['host'],stats['up'],rep['rep_mod']),
+    header=['pgmon - postgres(%s) @ %s, since %s, connections: %s, checkpoints_timed: %s%%, rep mode: %s' % (stats['ver'],stats['host'],stats['up'], stats['connections'], stats['checkpoints_timed'], rep['rep_mod']),
             'cpu: %5.1f idle, %5.1f iowait,  memory:  %s total,  %s free,  %s cached,  %s pg_share,  %s pg_private' % (stats['cpu']['idle'],stats['cpu']['iowait'],stats['memory']['total'],stats['memory']['free'],stats['memory']['cached'],stats['memory']['pg_share'],stats['memory']['pg_private']),
-            'pg_data(%s): %sB/%s%% used,%8.1fread,%8.1fwrite;    pg_wal(%s): %sB/%s%% used,%8.1fread,%8.1fwrite' % (stats['storage']['disk_data'],stats['storage']['usage_data'],stats['storage']['usage_data%']*100,stats['storage']['read_data'],stats['storage']['write_data'],stats['storage']['disk_wal'],stats['storage']['usage_wal'],stats['storage']['usage_wal%']*100,stats['storage']['read_wal'],stats['storage']['write_wal'])
+            'pg_data(%s): %sB/%s%% used,%8.1f read,%8.1f write;    pg_wal(%s): %sB/%s%% used,%8.1f read,%8.1f write' % (stats['storage']['disk_data'],stats['storage']['usage_data'],stats['storage']['usage_data%']*100,stats['storage']['read_data'],stats['storage']['write_data'],stats['storage']['disk_wal'],stats['storage']['usage_wal'],stats['storage']['usage_wal%']*100,stats['storage']['read_wal'],stats['storage']['write_wal'])
             ]
     if rep['rep_mod']=='master':
         for clt in rep['rep_list']:
@@ -955,7 +1055,7 @@ class IndexView(BaseView,StatsListener):
     def setActive(self):
         dblist=self.getDbList()
         if len(dblist) > 0:
-            default=dblist.keys()[0]
+            default=list(dblist.keys())[0]
             db=self.getInput('database name [%s]:' % default)
             if len(db)==0:
                 db=default
@@ -984,7 +1084,7 @@ class TableView(BaseView,StatsListener):
     def setActive(self):
         dblist=self.getDbList()
         if len(dblist) > 0:
-            default=dblist.keys()[0]
+            default=list(dblist.keys())[0]
             db=self.getInput('database name [%s]:' % default)
             if len(db)==0:
                 db=default
@@ -1093,6 +1193,36 @@ class DBView(BaseView,StatsListener):
                 self.lines= formatPgStateLines(stats,self.title) + formatTable(dbs,stats_items['db']['columns'],stats_items['db']['formats'],self.filter_name)
                 BaseView.updateContent(self)
 
+class VacuumView(BaseView,StatsListener):
+    def __init__(self):
+        BaseView.__init__(self,'v','Vacuum in progress:')
+        StatsListener.__init__(self,'vacuum')
+    def getSortColumns(self):
+        return ['pid','duration','table','phrase', 'heap_blks_total', 'scaned_p', 'heap_blks_vacuumed', 'index_vacuum_count', 'max_dead_tuples', 'num_dead_tuples']
+    def setActive(self):
+        dblist=self.getDbList()
+        if len(dblist) > 0:
+            default=list(dblist.keys())[0]
+            db=self.getInput('database name [%s]:' % default)
+            if len(db)==0:
+                db=default
+            if db in dblist:
+                self.dbName=db
+                self.title='Vacuum process list(%s):' % db
+                StatsListener.setActive(self)
+                return BaseView.setActive(self)
+        return False
+    def updateContent(self):
+        if self.stats_modified or self.refresh_required:
+            stats=self.getStats()
+            if 'ver' in stats:
+                if self.order_name!='':
+                    dbs=sorted(stats['vacuum'].values(),key=lambda s:s[self.order_name],reverse=True)
+                else:
+                    dbs=stats['vacuum'].values()
+                self.lines= formatPgStateLines(stats,self.title) + formatTable(dbs,stats_items['vacuum']['columns'],stats_items['vacuum']['formats'],self.filter_name)
+                BaseView.updateContent(self)
+
 class CursesApp:
     views={}
     currentView=None
@@ -1161,6 +1291,7 @@ class PgMonApp(CursesApp,StatsCollector):
         self.addStatsView(SessionView())
         self.addStatsView(TableView())
         self.addStatsView(IndexView())
+        self.addStatsView(VacuumView())
         self.addStatsView(SessionDetailView())
     def addStatsView(self,view):
         self.stats_views[view.activeKey]=view
